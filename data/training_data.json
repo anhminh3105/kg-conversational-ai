@@ -1,0 +1,189 @@
+[
+  {
+    "question": "Who acted in Forrest Gump?",
+    "intent": "FIND_ACTORS_IN_MOVIE",
+    "entities": {"movie": "Forrest Gump"},
+    "cypher": "MATCH (p:Person)-[r:ACTED_IN]->(m:Movie {title: 'Forrest Gump'}) RETURN p.name, r.role"
+  },
+  {
+    "question": "Who starred in Forrest Gump?",
+    "intent": "FIND_ACTORS_IN_MOVIE",
+    "entities": {"movie": "Forrest Gump"}
+  },
+  {
+    "question": "Who was in Forrest Gump?",
+    "intent": "FIND_ACTORS_IN_MOVIE",
+    "entities": {"movie": "Forrest Gump"}
+  },
+  {
+    "question": "Show me the cast of Forrest Gump",
+    "intent": "FIND_ACTORS_IN_MOVIE",
+    "entities": {"movie": "Forrest Gump"}
+  },
+  {
+    "question": "Forrest Gump actors",
+    "intent": "FIND_ACTORS_IN_MOVIE",
+    "entities": {"movie": "Forrest Gump"}
+  },
+  {
+    "question": "List actors in Titanic",
+    "intent": "FIND_ACTORS_IN_MOVIE",
+    "entities": {"movie": "Titanic"}
+  },
+  {
+    "question": "Who played in Cast Away?",
+    "intent": "FIND_ACTORS_IN_MOVIE",
+    "entities": {"movie": "Cast Away"}
+  },
+  {
+    "question": "Cast of Titanic",
+    "intent": "FIND_ACTORS_IN_MOVIE",
+    "entities": {"movie": "Titanic"}
+  },
+  {
+    "question": "What movies did Tom Hanks act in?",
+    "intent": "FIND_MOVIES_BY_ACTOR",
+    "entities": {"actor": "Tom Hanks"},
+    "cypher": "MATCH (p:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie) RETURN m.title, m.year"
+  },
+  {
+    "question": "Tom Hanks movies",
+    "intent": "FIND_MOVIES_BY_ACTOR",
+    "entities": {"actor": "Tom Hanks"}
+  },
+  {
+    "question": "Show me films with Tom Hanks",
+    "intent": "FIND_MOVIES_BY_ACTOR",
+    "entities": {"actor": "Tom Hanks"}
+  },
+  {
+    "question": "List Leonardo DiCaprio movies",
+    "intent": "FIND_MOVIES_BY_ACTOR",
+    "entities": {"actor": "Leonardo DiCaprio"}
+  },
+  {
+    "question": "Which movies has Kate Winslet been in?",
+    "intent": "FIND_MOVIES_BY_ACTOR",
+    "entities": {"actor": "Kate Winslet"}
+  },
+  {
+    "question": "Robin Wright filmography",
+    "intent": "FIND_MOVIES_BY_ACTOR",
+    "entities": {"actor": "Robin Wright"}
+  },
+  {
+    "question": "What has Tom Hanks starred in?",
+    "intent": "FIND_MOVIES_BY_ACTOR",
+    "entities": {"actor": "Tom Hanks"}
+  },
+  {
+    "question": "Who directed Forrest Gump?",
+    "intent": "FIND_DIRECTOR",
+    "entities": {"movie": "Forrest Gump"},
+    "cypher": "MATCH (p:Person)-[:DIRECTED]->(m:Movie {title: 'Forrest Gump'}) RETURN p.name"
+  },
+  {
+    "question": "Who is the director of Titanic?",
+    "intent": "FIND_DIRECTOR",
+    "entities": {"movie": "Titanic"}
+  },
+  {
+    "question": "Forrest Gump director",
+    "intent": "FIND_DIRECTOR",
+    "entities": {"movie": "Forrest Gump"}
+  },
+  {
+    "question": "Director of Cast Away",
+    "intent": "FIND_DIRECTOR",
+    "entities": {"movie": "Cast Away"}
+  },
+  {
+    "question": "Who made Titanic?",
+    "intent": "FIND_DIRECTOR",
+    "entities": {"movie": "Titanic"}
+  },
+  {
+    "question": "What movies did Robert Zemeckis direct?",
+    "intent": "FIND_MOVIES_BY_DIRECTOR",
+    "entities": {"director": "Robert Zemeckis"},
+    "cypher": "MATCH (p:Person {name: 'Robert Zemeckis'})-[:DIRECTED]->(m:Movie) RETURN m.title, m.year"
+  },
+  {
+    "question": "Robert Zemeckis films",
+    "intent": "FIND_MOVIES_BY_DIRECTOR",
+    "entities": {"director": "Robert Zemeckis"}
+  },
+  {
+    "question": "Movies directed by Robert Zemeckis",
+    "intent": "FIND_MOVIES_BY_DIRECTOR",
+    "entities": {"director": "Robert Zemeckis"}
+  },
+  {
+    "question": "Show me Robert Zemeckis movies",
+    "intent": "FIND_MOVIES_BY_DIRECTOR",
+    "entities": {"director": "Robert Zemeckis"}
+  },
+  {
+    "question": "How are Tom Hanks and Robin Wright connected?",
+    "intent": "FIND_PATH",
+    "entities": {"actors": ["Tom Hanks", "Robin Wright"]},
+    "cypher": "MATCH path = shortestPath((p1:Person {name: 'Tom Hanks'})-[*]-(p2:Person {name: 'Robin Wright'})) RETURN path"
+  },
+  {
+    "question": "Connection between Tom Hanks and Kate Winslet",
+    "intent": "FIND_PATH",
+    "entities": {"actors": ["Tom Hanks", "Kate Winslet"]}
+  },
+  {
+    "question": "Path from Tom Hanks to Leonardo DiCaprio",
+    "intent": "FIND_PATH",
+    "entities": {"actors": ["Tom Hanks", "Leonardo DiCaprio"]}
+  },
+  {
+    "question": "How is Tom Hanks related to Robin Wright?",
+    "intent": "FIND_PATH",
+    "entities": {"actors": ["Tom Hanks", "Robin Wright"]}
+  },
+  {
+    "question": "How many movies did Tom Hanks make?",
+    "intent": "COUNT_MOVIES",
+    "entities": {"actor": "Tom Hanks"},
+    "cypher": "MATCH (p:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie) RETURN count(m) as movie_count"
+  },
+  {
+    "question": "Count Tom Hanks movies",
+    "intent": "COUNT_MOVIES",
+    "entities": {"actor": "Tom Hanks"}
+  },
+  {
+    "question": "Number of Leonardo DiCaprio films",
+    "intent": "COUNT_MOVIES",
+    "entities": {"actor": "Leonardo DiCaprio"}
+  },
+  {
+    "question": "How many films has Kate Winslet acted in?",
+    "intent": "COUNT_MOVIES",
+    "entities": {"actor": "Kate Winslet"}
+  },
+  {
+    "question": "Who acted with Tom Hanks?",
+    "intent": "FIND_COACTORS",
+    "entities": {"actor": "Tom Hanks"},
+    "cypher": "MATCH (p1:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m:Movie)<-[:ACTED_IN]-(p2:Person) RETURN DISTINCT p2.name as coactor, m.title as movie"
+  },
+  {
+    "question": "Tom Hanks co-stars",
+    "intent": "FIND_COACTORS",
+    "entities": {"actor": "Tom Hanks"}
+  },
+  {
+    "question": "Who has worked with Tom Hanks?",
+    "intent": "FIND_COACTORS",
+    "entities": {"actor": "Tom Hanks"}
+  },
+  {
+    "question": "Leonardo DiCaprio co-actors",
+    "intent": "FIND_COACTORS",
+    "entities": {"actor": "Leonardo DiCaprio"}
+  }
+]
