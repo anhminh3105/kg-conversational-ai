@@ -56,8 +56,15 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+### Start Neo4j
+```bash
+sudo systemctl start neo4j
+```
+
 ### Download SpaCy model (optional, for enhanced NER)
+```bash
 python -m spacy download en_core_web_sm
+```
 
 ## 🗄️ Neo4j Setup
 
