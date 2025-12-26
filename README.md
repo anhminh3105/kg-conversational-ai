@@ -4,7 +4,7 @@ This component aims to build a system that translates questions into queries for
 
 ## Overview
 
-This project implements two approaches for converting natural language questions into Cypher queries:
+This project implements three approaches for knowledge graph question answering:
 
 1. **ML-based Approach** ([`scripts/nlp_to_cypher.py`](scripts/nlp_to_cypher.py)): Uses FastText embeddings and scikit-learn classifiers
 
@@ -21,6 +21,7 @@ This project implements two approaches for converting natural language questions
                   ↓
             Results
       ```
+
 2. **Transformer-based Approach** ([`scripts/llm_light_train.py`](scripts/llm_light_train.py)): Fine-tunes T5-small model for direct question-to-Cypher translation
 
       ```
@@ -31,6 +32,22 @@ This project implements two approaches for converting natural language questions
             Neo4j Execution
                   ↓
             Results
+      ```
+
+3. **RAG-based Approach** ([`scripts/index_rag.py`](scripts/index_rag.py)): Retrieval-Augmented Generation over KG triplets
+
+      ```
+            KG Triplets (canon_kg.txt)
+                  ↓
+            Embed & Index (FAISS)
+                  ↓
+            Natural Language Question
+                  ↓
+            Semantic Retrieval
+                  ↓
+            LLM Generation
+                  ↓
+            Answer with Sources
       ```
 
 ## 🚀 Installation
@@ -76,21 +93,37 @@ python scripts/import_kg_data_from_json.py
 ## 📊 Project Structure
 
 ```
-thesis/
+kg-conversational-ai/
 ├── data/
 │   ├── movie_data.csv              # Sample movie dataset
 │   └── training_data_complete.json # Training examples (with Cypher)
 ├── models/                         # Saved models (generated)
 │   ├── intent_classifier.pkl       # ML classifier
 │   └── question_to_cypher/         # Fine-tuned T5 model
+├── rag/                            # RAG module
+│   ├── __init__.py                 # Module exports
+│   ├── triplet_loader.py           # Step 1: Load triplets
+│   ├── representation.py           # Step 2: Convert to text
+│   ├── embedder.py                 # Step 3: Generate embeddings
+│   ├── faiss_store.py              # Step 4: FAISS vector store
+│   ├── kg_rag_indexer.py           # Main orchestrator (Steps 1-4)
+│   ├── retriever.py                # Step 5: Retrieval interface
+│   ├── prompt_builder.py           # Step 6: Prompt augmentation
+│   ├── generator.py                # Step 7: LLM generation
+│   ├── prompt_templates/           # Prompt templates
+│   └── edc/                        # EDC pipeline (LLM utilities)
 ├── scripts/
 │   ├── import_kg_data_from_json.py # Data import script
 │   ├── nlp_to_cypher.py            # ML-based NLP-to-Cypher
 │   ├── llm_light_train.py          # Transformer training
 │   ├── llm_light_demo.py           # Transformer demo/inference
+│   ├── index_rag.py                # RAG CLI script
 │   └── visulize_graph.py           # Graph visualization
-├── environment.yml                  # Conda environment
-├── requirements.txt                 # pip requirements
+├── export_google_ai.sh             # Google AI Studio config
+├── export_sambanova.sh             # SambaNova config
+├── export_local_llm.sh             # Local LLM config
+├── environment.yml                 # Conda environment
+├── requirements.txt                # pip requirements
 └── README.md
 ```
 
@@ -161,7 +194,80 @@ Batch processing:
 python scripts/llm_light_demo.py --batch questions.txt
 ```
 
-### 3. Visualize Knowledge Graph
+### 3. RAG-based Approach (KG Triplet Q&A)
+
+The RAG module provides semantic search and LLM-powered question answering over knowledge graph triplets.
+
+#### Prerequisites
+
+Install FAISS for vector search:
+```bash
+pip install faiss-cpu  # or faiss-gpu for GPU support
+```
+
+#### Step 1: Index Triplets
+
+Index triplets from EDC pipeline output (`canon_kg.txt`):
+```bash
+python scripts/index_rag.py --input ./rag/edc/output/tmp --output_dir ./output/rag
+```
+
+#### Step 2: Search (Retrieval Only)
+
+Search for relevant triplets without LLM generation:
+```bash
+# Single query
+python scripts/index_rag.py --load ./output/rag --query "Where is Trane located?"
+
+# Interactive mode
+python scripts/index_rag.py --load ./output/rag --interactive
+```
+
+#### Step 3: Generate Answers with LLM
+
+Configure an LLM provider first:
+```bash
+# Option 1: Google AI Studio (recommended - free, no GPU required)
+source export_google_ai.sh
+
+# Option 2: SambaNova (free, no GPU required)
+source export_sambanova.sh
+
+# Option 3: Local LLM (requires GPU + bitsandbytes)
+source export_local_llm.sh
+```
+
+Then generate answers:
+```bash
+# Single query with LLM answer
+python scripts/index_rag.py --load ./output/rag --generate --query "Where is Trane located?"
+
+# Interactive Q&A with LLM
+python scripts/index_rag.py --load ./output/rag --generate --interactive
+```
+
+#### Programmatic Usage
+
+```python
+from rag import KGRagIndexer, KGRagGenerator
+
+# Index triplets
+indexer = KGRagIndexer()
+indexer.index_from_path("./rag/edc/output/tmp", mode="triplet_text")
+indexer.save("./output/rag")
+
+# Load and search
+indexer = KGRagIndexer.load("./output/rag")
+results = indexer.search("Where is Trane located?", top_k=5)
+
+# Full RAG with LLM generation
+generator = KGRagGenerator(indexer)
+result = generator.generate("Where is Trane located?")
+print(result.answer)    # "Trane is located in Swords, Dublin."
+print(result.sources)   # [(Trane, location, Swords_Dublin)]
+```
+
+### 4. Visualize Knowledge Graph
 
 ```bash
 python scripts/visulize_graph.py
@@ -200,9 +306,14 @@ python scripts/llm_light_train.py
 - **Hugging Face** for transformer models
 - **FastText** for word embeddings
 - **SpaCy** for NLP tools
+- **FAISS** for vector similarity search
+- **Sentence Transformers** for embeddings
 
 ## 📚 References
 
 - [Neo4j Cypher Manual](https://neo4j.com/docs/cypher-manual/)
 - [T5 Paper](https://arxiv.org/abs/1910.10683)
 - [FastText Documentation](https://fasttext.cc/)
+- [FAISS Documentation](https://faiss.ai/)
+- [Sentence Transformers](https://www.sbert.net/)
+- [EDC Framework](https://arxiv.org/abs/2404.03868)
