@@ -1,0 +1,3 @@
+[submodule "rag/edc"]
+	path = rag/edc
+	url = git@github.com:anhminh3105/edc.git
