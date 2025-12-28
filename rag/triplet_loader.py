@@ -31,6 +31,25 @@ class Triplet:
     
     def __repr__(self) -> str:
         return f"({self.subject}, {self.predicate}, {self.obj})"
+    
+    def __hash__(self) -> int:
+        """Enable hashing for deduplication."""
+        return hash((self.subject, self.predicate, self.obj))
+    
+    def __eq__(self, other) -> bool:
+        """Check equality based on triplet content."""
+        if not isinstance(other, Triplet):
+            return False
+        return (self.subject, self.predicate, self.obj) == (other.subject, other.predicate, other.obj)
+    
+    def normalized(self) -> "Triplet":
+        """Return a normalized version with underscores replaced by spaces."""
+        return Triplet(
+            subject=self.subject.replace("_", " "),
+            predicate=self.predicate.replace("_", " "),
+            obj=self.obj.replace("_", " "),
+            source_text=self.source_text,
+        )
 
 
 class TripletLoader:
@@ -103,12 +122,19 @@ class TripletLoader:
             "Make sure you've run the EDC pipeline first."
         )
     
-    def parse(self, skip_invalid: bool = True) -> List[Triplet]:
+    def parse(
+        self,
+        skip_invalid: bool = True,
+        deduplicate: bool = True,
+        normalize: bool = True,
+    ) -> List[Triplet]:
         """
         Parse all triplets from the loaded file.
         
         Args:
             skip_invalid: If True, skip lines with invalid data
+            deduplicate: If True, remove duplicate triplets
+            normalize: If True, normalize entity names (replace underscores with spaces)
             
         Returns:
             List of parsed Triplet objects
@@ -130,7 +156,22 @@ class TripletLoader:
                 else:
                     raise
         
-        logger.info(f"Parsed {len(self.triplets)} triplets from {len(self.raw_lines)} lines")
+        raw_count = len(self.triplets)
+        logger.info(f"Parsed {raw_count} triplets from {len(self.raw_lines)} lines")
+        
+        # Normalize entity names (replace underscores with spaces)
+        if normalize:
+            self.triplets = [t.normalized() for t in self.triplets]
+            logger.info("Normalized entity names (replaced underscores with spaces)")
+        
+        # Deduplicate triplets
+        if deduplicate:
+            original_count = len(self.triplets)
+            self.triplets = list(dict.fromkeys(self.triplets))  # Preserves order
+            dedup_count = original_count - len(self.triplets)
+            if dedup_count > 0:
+                logger.info(f"Removed {dedup_count} duplicate triplets ({len(self.triplets)} unique)")
+        
         if skipped_count > 0:
             logger.info(f"Skipped {skipped_count} invalid lines")
         

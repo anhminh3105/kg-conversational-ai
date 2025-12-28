@@ -1,4 +1,5 @@
 *.bin
 *.gz
 *.pkl
-
+output/
+*.pyc

@@ -91,6 +91,8 @@ class KGRagIndexer:
         mode: str = "triplet_text",
         batch_size: int = 32,
         show_progress: bool = True,
+        deduplicate: bool = True,
+        normalize: bool = True,
     ) -> "KGRagIndexer":
         """
         Index triplets from EDC pipeline output (canon_kg.txt).
@@ -102,6 +104,8 @@ class KGRagIndexer:
             mode: Representation mode ("triplet_text" or "entity_context")
             batch_size: Batch size for embedding
             show_progress: Whether to show progress bars
+            deduplicate: If True, remove duplicate triplets
+            normalize: If True, normalize entity names (replace underscores with spaces)
             
         Returns:
             Self for method chaining
@@ -115,8 +119,8 @@ class KGRagIndexer:
         logger.info("Step 1: Loading triplets from canon_kg.txt...")
         loader = TripletLoader(path)
         loader.load()
-        self.triplets = loader.parse()
-        logger.info(f"Loaded {len(self.triplets)} triplets")
+        self.triplets = loader.parse(deduplicate=deduplicate, normalize=normalize)
+        logger.info(f"Loaded {len(self.triplets)} unique triplets")
         
         if len(self.triplets) == 0:
             raise ValueError("No triplets found. Check your input file/directory.")

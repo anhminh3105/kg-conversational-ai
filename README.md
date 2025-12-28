@@ -209,7 +209,7 @@ pip install faiss-cpu  # or faiss-gpu for GPU support
 
 Index triplets from EDC pipeline output (`canon_kg.txt`):
 ```bash
-python scripts/index_rag.py --input ./rag/edc/output/tmp --output_dir ./output/rag
+python scripts/index_rag.py --input ./rag/edc/output_webnlg/iter2 --output_dir ./output/rag
 ```
 
 #### Step 2: Search (Retrieval Only)
@@ -217,7 +217,7 @@ python scripts/index_rag.py --input ./rag/edc/output/tmp --output_dir ./output/r
 Search for relevant triplets without LLM generation:
 ```bash
 # Single query
-python scripts/index_rag.py --load ./output/rag --query "Where is Trane located?"
+python scripts/index_rag.py --load ./output/rag --query "What do you know about Morelos?"
 
 # Interactive mode
 python scripts/index_rag.py --load ./output/rag --interactive
@@ -240,7 +240,7 @@ source export_local_llm.sh
 Then generate answers:
 ```bash
 # Single query with LLM answer
-python scripts/index_rag.py --load ./output/rag --generate --query "Where is Trane located?"
+python scripts/index_rag.py --load ./output/rag --generate --query "What do you know about Trane?"
 
 # Interactive Q&A with LLM
 python scripts/index_rag.py --load ./output/rag --generate --interactive

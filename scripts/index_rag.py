@@ -63,6 +63,8 @@ def index_mode(args: argparse.Namespace) -> None:
         mode=args.mode,
         batch_size=args.batch_size,
         show_progress=True,
+        deduplicate=not args.no_deduplicate,
+        normalize=not args.no_normalize,
     )
 
     # Save
@@ -314,6 +316,16 @@ Examples:
         type=int,
         default=32,
         help="Batch size for embedding (default: 32)",
+    )
+    parser.add_argument(
+        "--no_deduplicate",
+        action="store_true",
+        help="Disable deduplication of triplets (default: enabled)",
+    )
+    parser.add_argument(
+        "--no_normalize",
+        action="store_true",
+        help="Disable entity name normalization (default: enabled)",
     )
 
     # Model options
