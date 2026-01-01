@@ -7,6 +7,7 @@ This module provides functionality to:
 3. Generate embeddings using sentence-transformers
 4. Store and retrieve from FAISS index
 5. Retrieve relevant triplets for a query
+5.5. Expand triplets using LLM (optional)
 6. Build augmented prompts with KG context
 7. Generate answers using local LLM
 
@@ -26,6 +27,11 @@ Usage:
     generator = KGRagGenerator(indexer)
     result = generator.generate("Where is Trane located?")
     print(result.answer)
+    
+    # RAG with triplet expansion (enriches sparse facts)
+    result = generator.generate("Where is Trane located?", expand_triplets=True)
+    print(result.answer)
+    print(f"Expanded triplets: {result.expanded_triplets}")
 """
 
 from .triplet_loader import TripletLoader, Triplet
@@ -35,6 +41,7 @@ from .faiss_store import FaissStore, SearchResult
 from .kg_rag_indexer import KGRagIndexer
 from .retriever import KGRetriever, RetrievalResult, ContextFormat
 from .prompt_builder import KGPromptBuilder, get_prompt_builder
+from .triplet_expander import TripletExpander, get_triplet_expander
 from .generator import KGRagGenerator, GenerationResult, create_generator
 
 __all__ = [
@@ -65,6 +72,10 @@ __all__ = [
     "KGRetriever",
     "RetrievalResult",
     "ContextFormat",
+    
+    # Triplet Expansion (Step 5.5)
+    "TripletExpander",
+    "get_triplet_expander",
     
     # Prompt Building (Step 6)
     "KGPromptBuilder",

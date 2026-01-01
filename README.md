@@ -45,6 +45,8 @@ This project implements three approaches for knowledge graph question answering:
                   ↓
             Semantic Retrieval
                   ↓
+            [Optional] Triplet Expansion (LLM)
+                  ↓
             LLM Generation
                   ↓
             Answer with Sources
@@ -108,10 +110,14 @@ kg-conversational-ai/
 │   ├── faiss_store.py              # Step 4: FAISS vector store
 │   ├── kg_rag_indexer.py           # Main orchestrator (Steps 1-4)
 │   ├── retriever.py                # Step 5: Retrieval interface
+│   ├── triplet_expander.py         # Step 5.5: LLM triplet expansion
 │   ├── prompt_builder.py           # Step 6: Prompt augmentation
 │   ├── generator.py                # Step 7: LLM generation
-│   ├── prompt_templates/           # Prompt templates
-│   └── edc/                        # EDC pipeline (LLM utilities)
+│   └── edc/                        # EDC pipeline
+│       ├── prompt_templates/       # All prompt templates
+│       │   ├── kg_qa.txt           # QA prompt template
+│       │   └── triplet_expansion.txt # Expansion prompt template
+│       └── schemas/                # Schema definitions
 ├── scripts/
 │   ├── import_kg_data_from_json.py # Data import script
 │   ├── nlp_to_cypher.py            # ML-based NLP-to-Cypher
@@ -246,6 +252,33 @@ python scripts/index_rag.py --load ./output/rag --generate --query "What do you 
 python scripts/index_rag.py --load ./output/rag --generate --interactive
 ```
 
+#### Step 4: Triplet Expansion (Optional)
+
+When retrieved triplets are sparse or insufficient, use `--expand` to have the LLM generate additional related triplets based on its parametric knowledge:
+
+```bash
+# Generate with triplet expansion
+python scripts/index_rag.py --load ./output/rag --generate --expand --query "Where was Alan Shepard born?"
+
+# Interactive mode with expansion
+python scripts/index_rag.py --load ./output/rag --generate --expand --interactive
+
+# Control expansion parameters
+python scripts/index_rag.py --load ./output/rag --generate --expand \
+  --max_expansion 10 \
+  --schema ./rag/edc/schemas/webnlg_schema.csv \
+  --query "What do you know about Morelos?"
+```
+
+**Expansion Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--expand` | disabled | Enable LLM triplet expansion |
+| `--max_expansion` | 10 | Maximum triplets to generate |
+| `--schema` | auto-detect | Path to schema CSV for valid predicates |
+
+The expansion uses the schema to constrain generated predicates, ensuring consistency with the knowledge graph ontology.
+
 #### Programmatic Usage
 
 ```python
@@ -265,6 +298,36 @@ generator = KGRagGenerator(indexer)
 result = generator.generate("Where is Trane located?")
 print(result.answer)    # "Trane is located in Swords, Dublin."
 print(result.sources)   # [(Trane, location, Swords_Dublin)]
+
+# RAG with triplet expansion (enriches sparse facts)
+result = generator.generate(
+    "Where was Alan Shepard born?",
+    expand_triplets=True,      # Enable LLM expansion
+    max_expansion=10,          # Max triplets to generate
+)
+print(result.answer)
+print(result.sources)           # All triplets (retrieved + expanded)
+print(result.expanded_triplets) # Only the LLM-generated triplets
+```
+
+#### TripletExpander (Standalone Usage)
+
+```python
+from rag import TripletExpander
+
+# Create expander with schema constraints
+expander = TripletExpander(schema_path="./rag/edc/schemas/webnlg_schema.csv")
+
+# Expand sparse triplets
+retrieved = [("Alan_Shepard", "birthPlace", "New_Hampshire")]
+expanded = expander.expand(
+    query="Tell me about Alan Shepard's career",
+    retrieved_triplets=retrieved,
+    max_new_triplets=5,
+)
+# expanded might include:
+# [("Alan_Shepard", "occupation", "Astronaut"),
+#  ("Alan_Shepard", "mission", "Apollo_14"), ...]
 ```
 
 ### 4. Visualize Knowledge Graph

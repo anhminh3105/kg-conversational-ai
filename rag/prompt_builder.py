@@ -14,7 +14,7 @@ from .retriever import RetrievalResult
 logger = logging.getLogger(__name__)
 
 # Default template path
-DEFAULT_TEMPLATE_PATH = Path(__file__).parent / "prompt_templates" / "kg_qa.txt"
+DEFAULT_TEMPLATE_PATH = Path(__file__).parent / "edc" / "prompt_templates" / "kg_qa.txt"
 
 # Fallback template if file not found
 FALLBACK_TEMPLATE = """You are a knowledge graph question answering assistant.

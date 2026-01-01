@@ -6,6 +6,7 @@ Supports:
 - Indexing triplets from EDC pipeline output (canon_kg.txt)
 - Search-only mode (retrieve relevant triplets)
 - Generate mode (full RAG with LLM answer generation)
+- Triplet expansion mode (expand sparse triplets using LLM)
 
 Usage:
     # Index EDC output
@@ -17,8 +18,11 @@ Usage:
     # Generate answers with LLM (configure provider first: source export_google_ai.sh)
     python scripts/index_rag.py --load ./output/rag --generate --query "Where is Trane located?"
 
-    # Interactive Q&A with LLM
-    python scripts/index_rag.py --load ./output/rag --generate --interactive
+    # Generate with triplet expansion (enriches sparse retrieved facts)
+    python scripts/index_rag.py --load ./output/rag --generate --expand --query "Where is Trane located?"
+
+    # Interactive Q&A with LLM and expansion
+    python scripts/index_rag.py --load ./output/rag --generate --expand --interactive
 """
 
 import argparse
@@ -124,12 +128,29 @@ def generate_mode(args: argparse.Namespace) -> None:
         use_gpu_faiss=args.gpu_faiss,
     )
 
-    # Create generator
+    # Create generator with optional schema for expansion
     logger.info("Initializing KG-RAG Generator...")
-    generator = KGRagGenerator(indexer)
+    generator = KGRagGenerator(
+        indexer,
+        schema_path=getattr(args, 'schema', None),
+    )
+    
+    # Check if expansion is enabled
+    expand_triplets = getattr(args, 'expand', False)
+    max_expansion = getattr(args, 'max_expansion', 10)
+    
+    if expand_triplets:
+        logger.info("Triplet expansion enabled")
 
     if args.interactive:
-        interactive_generate(generator, args.top_k, args.temperature, args.max_tokens)
+        interactive_generate(
+            generator,
+            args.top_k,
+            args.temperature,
+            args.max_tokens,
+            expand_triplets=expand_triplets,
+            max_expansion=max_expansion,
+        )
     elif args.query:
         # Single query
         result = generator.generate(
@@ -137,6 +158,8 @@ def generate_mode(args: argparse.Namespace) -> None:
             top_k=args.top_k,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
+            expand_triplets=expand_triplets,
+            max_expansion=max_expansion,
         )
         print_generation_result(result)
     else:
@@ -176,10 +199,14 @@ def interactive_generate(
     top_k: int = 10,
     temperature: float = 0.1,
     max_tokens: int = 256,
+    expand_triplets: bool = False,
+    max_expansion: int = 10,
 ) -> None:
     """Interactive Q&A loop with LLM generation."""
     print("\n" + "=" * 60)
     print("Interactive Q&A Mode (with LLM generation)")
+    if expand_triplets:
+        print(f"Triplet expansion: ENABLED (max {max_expansion} triplets)")
     print("Type 'quit' or 'exit' to stop")
     print("=" * 60 + "\n")
 
@@ -200,6 +227,8 @@ def interactive_generate(
                 top_k=top_k,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                expand_triplets=expand_triplets,
+                max_expansion=max_expansion,
             )
             print_generation_result(result)
 
@@ -246,15 +275,29 @@ def print_generation_result(result) -> None:
     print("\n>>> ANSWER <<<")
     print(result.answer)
 
-    print("\n--- Sources ---")
+    print("\n--- Retrieved Sources ---")
     if result.sources:
-        for (s, p, o), score in zip(result.sources, result.scores):
+        # Separate retrieved and expanded sources
+        expanded_triplets = result.expanded_triplets or []
+        num_retrieved = len(result.sources) - len(expanded_triplets)
+        
+        for i, ((s, p, o), score) in enumerate(zip(result.sources, result.scores)):
             s_h = s.replace("_", " ")
             p_h = p.replace("_", " ")
             o_h = o.replace("_", " ")
-            print(f"  [{score:.3f}] ({s_h}, {p_h}, {o_h})")
+            if i < num_retrieved:
+                print(f"  [{score:.3f}] ({s_h}, {p_h}, {o_h})")
     else:
         print("  No sources retrieved.")
+    
+    # Print expanded triplets if any
+    if result.expanded_triplets:
+        print(f"\n--- LLM-Expanded Facts ({len(result.expanded_triplets)}) ---")
+        for s, p, o in result.expanded_triplets:
+            s_h = s.replace("_", " ")
+            p_h = p.replace("_", " ")
+            o_h = o.replace("_", " ")
+            print(f"  [expanded] ({s_h}, {p_h}, {o_h})")
 
     print("=" * 60 + "\n")
 
@@ -275,8 +318,14 @@ Examples:
   source export_google_ai.sh  # or export_sambanova.sh
   python scripts/index_rag.py --load ./output/rag --generate --query "Where is Trane located?"
 
-  # Interactive Q&A with LLM
-  python scripts/index_rag.py --load ./output/rag --generate --interactive
+  # Generate with triplet expansion (LLM generates additional related facts)
+  python scripts/index_rag.py --load ./output/rag --generate --expand --query "Where is Trane located?"
+
+  # Interactive Q&A with LLM and expansion
+  python scripts/index_rag.py --load ./output/rag --generate --expand --interactive
+
+  # Expansion with custom schema file
+  python scripts/index_rag.py --load ./output/rag --generate --expand --schema ./rag/edc/schemas/webnlg_schema.csv --query "..."
 
   # Interactive search (retrieval only)
   python scripts/index_rag.py --load ./output/rag --interactive
@@ -380,6 +429,24 @@ Examples:
         type=int,
         default=256,
         help="Maximum tokens to generate (default: 256)",
+    )
+    
+    # Triplet expansion options
+    parser.add_argument(
+        "--expand",
+        action="store_true",
+        help="Enable triplet expansion: use LLM to generate additional related triplets",
+    )
+    parser.add_argument(
+        "--max_expansion",
+        type=int,
+        default=10,
+        help="Maximum number of triplets to generate during expansion (default: 10)",
+    )
+    parser.add_argument(
+        "--schema",
+        default=None,
+        help="Path to schema CSV file for triplet expansion (default: auto-detect)",
     )
 
     # Logging
