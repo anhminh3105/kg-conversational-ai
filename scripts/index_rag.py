@@ -7,6 +7,7 @@ Supports:
 - Search-only mode (retrieve relevant triplets)
 - Generate mode (full RAG with LLM answer generation)
 - Triplet expansion mode (expand sparse triplets using LLM)
+- Triplet persistence (offline learning): save expanded triplets to improve future queries
 
 Usage:
     # Index EDC output
@@ -21,8 +22,11 @@ Usage:
     # Generate with triplet expansion (enriches sparse retrieved facts)
     python scripts/index_rag.py --load ./output/rag --generate --expand --query "Where is Trane located?"
 
-    # Interactive Q&A with LLM and expansion
-    python scripts/index_rag.py --load ./output/rag --generate --expand --interactive
+    # Generate with expansion AND persistence (offline learning)
+    python scripts/index_rag.py --load ./output/rag --generate --expand --persist --query "..."
+
+    # Interactive Q&A with LLM, expansion, and persistence
+    python scripts/index_rag.py --load ./output/rag --generate --expand --persist --interactive
 """
 
 import argparse
@@ -133,14 +137,21 @@ def generate_mode(args: argparse.Namespace) -> None:
     generator = KGRagGenerator(
         indexer,
         schema_path=getattr(args, 'schema', None),
+        index_path=args.load,  # Store path for auto-save
     )
     
     # Check if expansion is enabled
     expand_triplets = getattr(args, 'expand', False)
     max_expansion = getattr(args, 'max_expansion', 10)
     
+    # Check if persistence is enabled (--persist both adds to index AND saves to disk)
+    persist_expanded = getattr(args, 'persist', False)
+    similarity_threshold = getattr(args, 'similarity_threshold', 0.95)
+    
     if expand_triplets:
         logger.info("Triplet expansion enabled")
+    if persist_expanded:
+        logger.info(f"Triplet persistence enabled (threshold={similarity_threshold}, auto-save=on)")
 
     if args.interactive:
         interactive_generate(
@@ -150,6 +161,8 @@ def generate_mode(args: argparse.Namespace) -> None:
             args.max_tokens,
             expand_triplets=expand_triplets,
             max_expansion=max_expansion,
+            persist_expanded=persist_expanded,
+            similarity_threshold=similarity_threshold,
         )
     elif args.query:
         # Single query
@@ -160,6 +173,9 @@ def generate_mode(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             expand_triplets=expand_triplets,
             max_expansion=max_expansion,
+            persist_expanded=persist_expanded,
+            auto_save=persist_expanded,  # Auto-save when persist is enabled
+            similarity_threshold=similarity_threshold,
         )
         print_generation_result(result)
     else:
@@ -201,12 +217,16 @@ def interactive_generate(
     max_tokens: int = 256,
     expand_triplets: bool = False,
     max_expansion: int = 10,
+    persist_expanded: bool = False,
+    similarity_threshold: float = 0.95,
 ) -> None:
     """Interactive Q&A loop with LLM generation."""
     print("\n" + "=" * 60)
     print("Interactive Q&A Mode (with LLM generation)")
     if expand_triplets:
         print(f"Triplet expansion: ENABLED (max {max_expansion} triplets)")
+    if persist_expanded:
+        print(f"Triplet persistence: ENABLED (threshold={similarity_threshold}, auto-save=on)")
     print("Type 'quit' or 'exit' to stop")
     print("=" * 60 + "\n")
 
@@ -229,6 +249,9 @@ def interactive_generate(
                 max_tokens=max_tokens,
                 expand_triplets=expand_triplets,
                 max_expansion=max_expansion,
+                persist_expanded=persist_expanded,
+                auto_save=persist_expanded,  # Auto-save when persist is enabled
+                similarity_threshold=similarity_threshold,
             )
             print_generation_result(result)
 
@@ -298,6 +321,10 @@ def print_generation_result(result) -> None:
             p_h = p.replace("_", " ")
             o_h = o.replace("_", " ")
             print(f"  [expanded] ({s_h}, {p_h}, {o_h})")
+    
+    # Print persistence info if any triplets were persisted
+    if hasattr(result, 'persisted_count') and result.persisted_count > 0:
+        print(f"\n--- Persisted {result.persisted_count} new triplets to index ---")
 
     print("=" * 60 + "\n")
 
@@ -321,8 +348,14 @@ Examples:
   # Generate with triplet expansion (LLM generates additional related facts)
   python scripts/index_rag.py --load ./output/rag --generate --expand --query "Where is Trane located?"
 
-  # Interactive Q&A with LLM and expansion
-  python scripts/index_rag.py --load ./output/rag --generate --expand --interactive
+  # Expand AND persist triplets (offline learning mode)
+  python scripts/index_rag.py --load ./output/rag --generate --expand --persist --query "..."
+
+  # Persist with custom similarity threshold (default: 0.95)
+  python scripts/index_rag.py --load ./output/rag --generate --expand --persist --similarity-threshold 0.90 --query "..."
+
+  # Interactive Q&A with expansion and persistence
+  python scripts/index_rag.py --load ./output/rag --generate --expand --persist --interactive
 
   # Expansion with custom schema file
   python scripts/index_rag.py --load ./output/rag --generate --expand --schema ./rag/edc/schemas/webnlg_schema.csv --query "..."
@@ -447,6 +480,20 @@ Examples:
         "--schema",
         default=None,
         help="Path to schema CSV file for triplet expansion (default: auto-detect)",
+    )
+    
+    # Triplet persistence options (offline learning)
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="Persist expanded triplets to the index and save to disk (offline learning)",
+    )
+    parser.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=0.95,
+        dest="similarity_threshold",
+        help="Cosine similarity threshold for duplicate detection (default: 0.95)",
     )
 
     # Logging

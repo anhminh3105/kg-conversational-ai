@@ -42,6 +42,7 @@ from .kg_rag_indexer import KGRagIndexer
 from .retriever import KGRetriever, RetrievalResult, ContextFormat
 from .prompt_builder import KGPromptBuilder, get_prompt_builder
 from .triplet_expander import TripletExpander, get_triplet_expander
+from .duplicate_detector import DuplicateDetector, DuplicateCheckResult, get_duplicate_detector
 from .generator import KGRagGenerator, GenerationResult, create_generator
 
 __all__ = [
@@ -76,6 +77,11 @@ __all__ = [
     # Triplet Expansion (Step 5.5)
     "TripletExpander",
     "get_triplet_expander",
+    
+    # Duplicate Detection (for offline persistence)
+    "DuplicateDetector",
+    "DuplicateCheckResult",
+    "get_duplicate_detector",
     
     # Prompt Building (Step 6)
     "KGPromptBuilder",

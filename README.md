@@ -76,6 +76,25 @@ pip install -r requirements.txt
 ```
 
 ### Start Neo4j
+
+**Option A: Local installation (no root required)**
+```bash
+# First time setup (download Neo4j)
+mkdir -p ~/tools && cd ~/tools
+curl -L -o neo4j-community-5.26.0-unix.tar.gz "https://neo4j.com/artifact.php?name=neo4j-community-5.26.0-unix.tar.gz"
+tar -xzf neo4j-community-5.26.0-unix.tar.gz
+cd neo4j-community-5.26.0
+bin/neo4j-admin dbms set-initial-password password123
+
+# Start Neo4j
+~/tools/neo4j-community-5.26.0/bin/neo4j start
+
+# Other commands
+~/tools/neo4j-community-5.26.0/bin/neo4j stop     # Stop
+~/tools/neo4j-community-5.26.0/bin/neo4j status   # Check status
+```
+
+**Option B: System service (requires root)**
 ```bash
 sudo systemctl start neo4j
 ```
@@ -87,9 +106,35 @@ python -m spacy download en_core_web_sm
 
 ## 🗄️ Neo4j Setup
 
+| Setting | Value |
+|---------|-------|
+| Web UI | http://localhost:7474 |
+| Bolt URL | `bolt://localhost:7687` |
+| Username | `neo4j` |
+| Password | `password123` |
+
 #### Import sample data
 ```bash
 python scripts/import_kg_data_from_json.py
+```
+
+#### Troubleshooting: Authentication Errors
+
+If you encounter `neo4j.exceptions.AuthError: authentication failure`, the password may be out of sync. The `set-initial-password` command only works before the first database start.
+
+**Fix: Complete data reset**
+```bash
+# Stop Neo4j
+~/tools/neo4j-community-5.26.0/bin/neo4j stop
+
+# Remove all data (this deletes your database!)
+rm -rf ~/tools/neo4j-community-5.26.0/data/*
+
+# Set password fresh
+~/tools/neo4j-community-5.26.0/bin/neo4j-admin dbms set-initial-password password123
+
+# Start Neo4j
+~/tools/neo4j-community-5.26.0/bin/neo4j start
 ```
 
 ## 📊 Project Structure

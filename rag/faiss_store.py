@@ -265,6 +265,92 @@ class FaissStore:
     def size(self) -> int:
         """Number of vectors in the index."""
         return self.index.ntotal
+    
+    def add_with_metadata(
+        self,
+        embeddings: np.ndarray,
+        metadata_list: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Add embeddings with raw metadata dictionaries (no EmbeddableItem required).
+        
+        Useful for adding expanded triplets directly.
+        
+        Args:
+            embeddings: numpy array of shape (n, embedding_dim)
+            metadata_list: List of metadata dictionaries
+        """
+        if len(embeddings) != len(metadata_list):
+            raise ValueError(
+                f"Embeddings length ({len(embeddings)}) must match metadata length ({len(metadata_list)})"
+            )
+        
+        # Ensure embeddings are float32 and contiguous
+        embeddings = np.ascontiguousarray(embeddings.astype(np.float32))
+        
+        # Add to FAISS index
+        self.index.add(embeddings)
+        
+        # Store metadata
+        self.metadata.extend(metadata_list)
+        
+        logger.info(f"Added {len(embeddings)} vectors with metadata. Total: {self.index.ntotal}")
+    
+    def get_triplet_keys(self) -> List[Tuple[str, str, str]]:
+        """
+        Extract all triplet keys from metadata for duplicate checking.
+        
+        Returns:
+            List of (subject, predicate, object) tuples
+        """
+        keys = []
+        for meta in self.metadata:
+            subject = meta.get("subject", "")
+            predicate = meta.get("predicate", "")
+            obj = meta.get("object", "")
+            
+            if subject and predicate and obj:
+                keys.append((subject, predicate, obj))
+        
+        return keys
+    
+    def find_similar(
+        self,
+        query_embedding: np.ndarray,
+        threshold: float = 0.95,
+        top_k: int = 5,
+    ) -> List[SearchResult]:
+        """
+        Find vectors similar to the query above a threshold.
+        
+        Args:
+            query_embedding: Query vector of shape (embedding_dim,) or (1, embedding_dim)
+            threshold: Minimum similarity score (cosine similarity for normalized vectors)
+            top_k: Maximum number of results to check
+            
+        Returns:
+            List of SearchResult objects with score >= threshold
+        """
+        results = self.search(query_embedding, top_k=top_k)
+        return [r for r in results if r.score >= threshold]
+    
+    def has_similar(
+        self,
+        query_embedding: np.ndarray,
+        threshold: float = 0.95,
+    ) -> bool:
+        """
+        Check if any similar vector exists above the threshold.
+        
+        Args:
+            query_embedding: Query vector
+            threshold: Minimum similarity score
+            
+        Returns:
+            True if at least one similar vector exists
+        """
+        similar = self.find_similar(query_embedding, threshold=threshold, top_k=1)
+        return len(similar) > 0
 
 
 if __name__ == "__main__":

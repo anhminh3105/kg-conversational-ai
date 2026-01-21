@@ -11,10 +11,10 @@ Combines:
 import os
 import json
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from .triplet_loader import TripletLoader, Triplet
-from .representation import TripletRepresenter, RepresentationMode, EmbeddableItem, get_representer
+from .representation import TripletRepresenter, RepresentationMode, EmbeddableItem, get_representer, humanize
 from .embedder import Embedder, get_embedder, DEFAULT_MODEL
 from .faiss_store import FaissStore, SearchResult
 
@@ -343,3 +343,100 @@ class KGRagIndexer:
             "embedding_dim": self.embedder.embedding_dim if self._embedder else None,
             "representation_mode": self.representation_mode,
         }
+    
+    def add_expanded_triplets(
+        self,
+        triplets: List[Tuple[str, str, str]],
+        check_duplicates: bool = True,
+        similarity_threshold: float = 0.95,
+        source_tag: str = "llm_expanded",
+    ) -> int:
+        """
+        Add expanded triplets to the existing index.
+        
+        Filters out duplicates (both exact and semantic) before adding.
+        
+        Args:
+            triplets: List of (subject, predicate, object) tuples
+            check_duplicates: Whether to check for duplicates before adding
+            similarity_threshold: Cosine similarity threshold for semantic duplicates
+            source_tag: Tag to mark the source of these triplets in metadata
+            
+        Returns:
+            Number of triplets actually added (after duplicate filtering)
+        """
+        if not triplets:
+            return 0
+        
+        if self._store is None:
+            raise ValueError("Store not initialized. Cannot add triplets to uninitialized index.")
+        
+        logger.info(f"Adding {len(triplets)} expanded triplets to index")
+        
+        # Filter duplicates if requested
+        triplets_to_add = triplets
+        if check_duplicates:
+            from .duplicate_detector import DuplicateDetector
+            
+            detector = DuplicateDetector(self, similarity_threshold=similarity_threshold)
+            result = detector.filter_duplicates(triplets)
+            triplets_to_add = result.new_triplets
+            
+            if len(result.exact_duplicates) > 0 or len(result.semantic_duplicates) > 0:
+                logger.info(
+                    f"Filtered {len(result.exact_duplicates)} exact duplicates and "
+                    f"{len(result.semantic_duplicates)} semantic duplicates"
+                )
+        
+        if not triplets_to_add:
+            logger.info("No new triplets to add after duplicate filtering")
+            return 0
+        
+        # Convert triplets to embeddable items
+        items = []
+        for s, p, o in triplets_to_add:
+            # Create text representation (same as triplet_text mode)
+            text = f"{humanize(s)} {humanize(p)} {humanize(o)}"
+            
+            metadata = {
+                "subject": s,
+                "predicate": p,
+                "object": o,
+                "source_text": "",
+                "document": f"({s}, {p}, {o})",
+                "representation_mode": "triplet_text",
+                "source": source_tag,  # Mark as expanded triplet
+            }
+            
+            items.append(EmbeddableItem(text=text, metadata=metadata))
+        
+        # Generate embeddings
+        texts = [item.text for item in items]
+        embeddings = self.embedder.embed_texts(
+            texts,
+            show_progress=False,
+            normalize=True,
+        )
+        
+        # Add to store
+        self._store.add(embeddings, items)
+        
+        # Update internal state
+        for s, p, o in triplets_to_add:
+            self.triplets.append(Triplet(subject=s, predicate=p, obj=o))
+        self.items.extend(items)
+        
+        logger.info(f"Added {len(triplets_to_add)} new triplets to index (total: {self._store.size})")
+        
+        return len(triplets_to_add)
+    
+    def get_existing_triplet_keys(self) -> List[Tuple[str, str, str]]:
+        """
+        Get all existing triplet keys for duplicate checking.
+        
+        Returns:
+            List of (subject, predicate, object) tuples
+        """
+        if self._store is None:
+            return []
+        return self.store.get_triplet_keys()

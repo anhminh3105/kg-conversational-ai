@@ -2,6 +2,7 @@ name: nlp-kg
 channels:
   - conda-forge
   - pytorch
+  - nvidia
   - defaults
 
 dependencies:
@@ -56,10 +57,3 @@ dependencies:
 #
 # For CPU-only installation, remove the pytorch-cuda line above
 # For GPU support, ensure CUDA 11.8 is installed or adjust pytorch-cuda version
-  
-  # Utilities
-  - joblib>=1.1.0
-
-# Post-installation commands (run these after creating the environment):
-# conda activate thesis-nlp-kg
-# python -m spacy download en_core_web_sm  # Optional, if using SpaCy NER
