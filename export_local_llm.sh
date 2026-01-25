@@ -25,7 +25,7 @@ export USE_LOCAL_LLM=true
 #   - Qwen/Qwen2.5-3B-Instruct            (~6GB VRAM)
 #   - microsoft/Phi-3-mini-4k-instruct    (~8GB VRAM)
 # =============================================================================
-export LOCAL_LLM_MODEL="mistralai/Mistral-7B-Instruct-v0.3"
+export LOCAL_LLM_MODEL="Qwen/Qwen2.5-7B-Instruct"
 
 # =============================================================================
 # Embedder Model Configuration
