@@ -7,6 +7,7 @@ This script demonstrates the full pipeline:
 2. Create MCP Agent with Qwen2.5-7B
 3. Run agentic queries that use MCP tools to query the knowledge graph
 4. Show tool call traces and final answers
+5. Demonstrate triplet expansion to enrich sparse knowledge graphs
 
 Prerequisites:
 - Neo4j running at bolt://localhost:7687
@@ -17,7 +18,7 @@ Usage:
     # Source the local LLM config first
     source export_local_llm.sh
     
-    # Run demo
+    # Run full MCP agent demo
     python scripts/demo_mcp_agent.py
     
     # Run with custom Neo4j connection
@@ -28,6 +29,15 @@ Usage:
     
     # Test without loading the full LLM (uses API backend if configured)
     python scripts/demo_mcp_agent.py --lite
+    
+    # Run triplet expansion demo (shows how LLM generates new facts)
+    python scripts/demo_mcp_agent.py --expand
+    
+    # Run triplet expansion and persist to Neo4j
+    python scripts/demo_mcp_agent.py --expand --persist
+    
+    # Run simple search demo (no LLM required)
+    python scripts/demo_mcp_agent.py --simple
 """
 
 import argparse
@@ -206,7 +216,7 @@ def run_simple_search_demo(
         password=neo4j_password,
     )
     embedder = get_embedder()
-    handler = Neo4jMCPToolHandler(neo4j_store, embedder)
+    handler = Neo4jMCPToolHandler(neo4j_store, embedder, enable_expansion=True)
     
     print(f"\nConnected to Neo4j with {neo4j_store.size} triplets")
     print("\nAvailable MCP tools:")
@@ -227,6 +237,118 @@ def run_simple_search_demo(
         print(f"  [{fact.get('score', 0):.3f}] {fact.get('fact', '')}")
     
     neo4j_store.close()
+
+
+def run_triplet_expansion_demo(
+    neo4j_uri: str,
+    neo4j_user: str,
+    neo4j_password: str,
+    persist: bool = False,
+):
+    """
+    Demonstrate triplet expansion with MCP tools.
+    
+    Shows how the LLM can generate additional knowledge graph triplets
+    based on existing facts and a user query.
+    """
+    import json
+    
+    print("\n" + "=" * 60)
+    print("Triplet Expansion Demo")
+    print("=" * 60)
+    
+    from rag.neo4j_store import Neo4jStore
+    from rag.embedder import get_embedder
+    from rag.mcp_neo4j_server import Neo4jMCPToolHandler
+    
+    # Create components
+    print("\n[1] Setting up components...")
+    neo4j_store = Neo4jStore(
+        uri=neo4j_uri,
+        user=neo4j_user,
+        password=neo4j_password,
+    )
+    embedder = get_embedder()
+    handler = Neo4jMCPToolHandler(
+        neo4j_store, 
+        embedder, 
+        enable_expansion=True,
+        allow_cypher=True,
+    )
+    
+    print(f"  Neo4j connected with {neo4j_store.size} triplets")
+    print(f"  Triplet expansion: {'enabled' if handler.enable_expansion else 'disabled'}")
+    
+    # Step 1: Search for existing facts
+    print("\n[2] Searching knowledge graph for relevant facts...")
+    search_query = "Tell me about the main topic"
+    search_result = handler.handle_tool_call(
+        "search_knowledge_graph",
+        {"query": search_query, "top_k": 5}
+    )
+    search_data = json.loads(search_result)
+    
+    existing_facts = []
+    print(f"\n  Found {search_data.get('num_results', 0)} existing facts:")
+    for fact in search_data.get('facts', []):
+        print(f"    [{fact.get('score', 0):.3f}] {fact.get('fact', '')}")
+        existing_facts.append(fact.get('fact', ''))
+    
+    if not existing_facts:
+        print("\n  No existing facts found. Using sample facts for demo...")
+        existing_facts = [
+            "(Einstein, born_in, Germany)",
+            "(Einstein, field, Physics)",
+            "(Einstein, known_for, Relativity)",
+        ]
+        print("  Sample facts:")
+        for f in existing_facts:
+            print(f"    {f}")
+    
+    # Step 2: Expand triplets
+    print("\n[3] Expanding triplets using LLM...")
+    expansion_query = "What else do we know about this topic and related facts?"
+    
+    expand_result = handler.handle_tool_call(
+        "expand_triplets",
+        {
+            "query": expansion_query,
+            "existing_facts": existing_facts,
+            "max_new_triplets": 5,
+            "persist_to_graph": persist,
+        }
+    )
+    expand_data = json.loads(expand_result)
+    
+    if "error" in expand_data:
+        print(f"\n  Error: {expand_data['error']}")
+    else:
+        print(f"\n  Existing facts used: {expand_data.get('existing_facts_count', 0)}")
+        print(f"  New facts generated: {expand_data.get('expanded_facts_count', 0)}")
+        
+        if expand_data.get('expanded_facts'):
+            print("\n  Generated triplets:")
+            for fact in expand_data['expanded_facts']:
+                print(f"    + {fact.get('fact', '')}")
+                print(f"      (source: {fact.get('source', 'unknown')})")
+        
+        if persist and expand_data.get('persisted_count', 0) > 0:
+            print(f"\n  Persisted {expand_data['persisted_count']} triplets to Neo4j!")
+            print(f"  New total: {neo4j_store.size} triplets")
+    
+    # Step 3: Show how this helps answering questions
+    print("\n[4] How expansion helps answer questions:")
+    print("  " + "-" * 50)
+    print("  Without expansion: Only the original retrieved facts are available")
+    print("  With expansion: LLM generates additional relevant facts that can")
+    print("                  fill gaps in the knowledge graph and improve answers")
+    print("  " + "-" * 50)
+    
+    neo4j_store.close()
+    
+    print("\n" + "=" * 60)
+    print("Triplet Expansion Demo Complete!")
+    print("=" * 60)
 
 
 def main():
@@ -265,6 +387,16 @@ def main():
         action="store_true",
         help="Run simple search demo without LLM"
     )
+    parser.add_argument(
+        "--expand",
+        action="store_true",
+        help="Run triplet expansion demo"
+    )
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="Persist expanded triplets to Neo4j (use with --expand)"
+    )
     
     args = parser.parse_args()
     
@@ -283,7 +415,15 @@ def main():
         print("Please ensure Neo4j is running and try again.")
         sys.exit(1)
     
-    if args.simple:
+    if args.expand:
+        # Run triplet expansion demo
+        run_triplet_expansion_demo(
+            args.neo4j_uri,
+            args.neo4j_user,
+            neo4j_password,
+            persist=args.persist,
+        )
+    elif args.simple:
         # Run simple demo without LLM
         run_simple_search_demo(
             args.neo4j_uri,

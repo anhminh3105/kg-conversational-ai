@@ -118,6 +118,38 @@ NEO4J_TOOLS = [
                 "required": ["cypher"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "expand_triplets",
+            "description": "Generate additional knowledge graph triplets using LLM. Given a query and existing facts, uses the LLM to infer and generate new related triplets that help answer the question. Useful when retrieved facts are sparse or incomplete.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The user's question that needs more context"
+                    },
+                    "existing_facts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of existing facts in format '(subject, predicate, object)'"
+                    },
+                    "max_new_triplets": {
+                        "type": "integer",
+                        "description": "Maximum number of new triplets to generate (default: 5)",
+                        "default": 5
+                    },
+                    "persist_to_graph": {
+                        "type": "boolean",
+                        "description": "Whether to save generated triplets to the knowledge graph (default: false)",
+                        "default": False
+                    }
+                },
+                "required": ["query", "existing_facts"]
+            }
+        }
     }
 ]
 
@@ -141,6 +173,7 @@ class Neo4jMCPToolHandler:
         store: Neo4jStore instance for database operations
         embedder: Embedder instance for semantic search
         allow_cypher: Whether to allow raw Cypher queries (security consideration)
+        triplet_expander: Optional TripletExpander for generating new triplets
     """
     
     def __init__(
@@ -148,6 +181,8 @@ class Neo4jMCPToolHandler:
         neo4j_store,
         embedder,
         allow_cypher: bool = True,
+        enable_expansion: bool = True,
+        schema_path: Optional[str] = None,
     ):
         """
         Initialize the tool handler.
@@ -156,12 +191,26 @@ class Neo4jMCPToolHandler:
             neo4j_store: Neo4jStore instance
             embedder: Embedder instance for generating query embeddings
             allow_cypher: Whether to allow raw Cypher queries
+            enable_expansion: Whether to enable triplet expansion tool
+            schema_path: Optional path to schema CSV for triplet expansion
         """
         self.store = neo4j_store
         self.embedder = embedder
         self.allow_cypher = allow_cypher
+        self.enable_expansion = enable_expansion
         
-        logger.info(f"Initialized Neo4jMCPToolHandler (cypher={allow_cypher})")
+        # Initialize triplet expander if enabled
+        self.triplet_expander = None
+        if enable_expansion:
+            try:
+                from .triplet_expander import get_triplet_expander
+                self.triplet_expander = get_triplet_expander(schema_path=schema_path)
+                logger.info("Triplet expansion enabled")
+            except Exception as e:
+                logger.warning(f"Failed to initialize triplet expander: {e}")
+                self.enable_expansion = False
+        
+        logger.info(f"Initialized Neo4jMCPToolHandler (cypher={allow_cypher}, expansion={enable_expansion})")
     
     def get_tools(self, include_cypher: bool = None) -> List[Dict]:
         """
@@ -228,6 +277,18 @@ class Neo4jMCPToolHandler:
                         "error": "Cypher queries are disabled for security reasons"
                     })
                 return self._run_cypher(arguments["cypher"])
+            
+            elif tool_name == "expand_triplets":
+                if not self.enable_expansion:
+                    return json.dumps({
+                        "error": "Triplet expansion is not enabled"
+                    })
+                return self._expand_triplets(
+                    arguments["query"],
+                    arguments["existing_facts"],
+                    arguments.get("max_new_triplets", 5),
+                    arguments.get("persist_to_graph", False),
+                )
             
             else:
                 return json.dumps({
@@ -400,6 +461,121 @@ class Neo4jMCPToolHandler:
                 "error": f"Cypher execution failed: {str(e)}",
                 "query": cypher,
             })
+    
+    def _expand_triplets(
+        self,
+        query: str,
+        existing_facts: List[str],
+        max_new_triplets: int,
+        persist_to_graph: bool,
+    ) -> str:
+        """
+        Expand triplets using LLM to generate additional related facts.
+        
+        Args:
+            query: User's question
+            existing_facts: List of fact strings in format "(subject, predicate, object)"
+            max_new_triplets: Maximum new triplets to generate
+            persist_to_graph: Whether to save to Neo4j
+            
+        Returns:
+            JSON string with expanded triplets
+        """
+        import re
+        
+        # Parse existing facts into triplet tuples
+        triplet_pattern = r'\(([^,]+),\s*([^,]+),\s*([^)]+)\)'
+        existing_triplets = []
+        
+        for fact in existing_facts:
+            match = re.search(triplet_pattern, fact)
+            if match:
+                s = match.group(1).strip().replace(" ", "_")
+                p = match.group(2).strip().replace(" ", "_")
+                o = match.group(3).strip().replace(" ", "_")
+                existing_triplets.append((s, p, o))
+        
+        if not existing_triplets:
+            return json.dumps({
+                "error": "No valid triplets provided. Format: (subject, predicate, object)",
+                "query": query,
+            })
+        
+        # Validate max_new_triplets
+        max_new_triplets = min(max(1, max_new_triplets), 15)
+        
+        # Call triplet expander
+        try:
+            expanded_triplets = self.triplet_expander.expand(
+                query=query,
+                retrieved_triplets=existing_triplets,
+                max_new_triplets=max_new_triplets,
+                temperature=0.3,
+            )
+        except Exception as e:
+            return json.dumps({
+                "error": f"Triplet expansion failed: {str(e)}",
+                "query": query,
+            })
+        
+        # Format expanded triplets
+        expanded_facts = []
+        for s, p, o in expanded_triplets:
+            s_h = s.replace("_", " ")
+            p_h = p.replace("_", " ")
+            o_h = o.replace("_", " ")
+            expanded_facts.append({
+                "fact": f"({s_h}, {p_h}, {o_h})",
+                "subject": s,
+                "predicate": p,
+                "object": o,
+                "source": "llm_expanded",
+            })
+        
+        # Persist to graph if requested
+        persisted_count = 0
+        if persist_to_graph and expanded_triplets:
+            try:
+                from .representation import EmbeddableItem
+                import numpy as np
+                
+                # Generate embeddings for new triplets
+                texts = [f"{s.replace('_', ' ')} {p.replace('_', ' ')} {o.replace('_', ' ')}" 
+                         for s, p, o in expanded_triplets]
+                embeddings = self.embedder.embed_texts(texts, normalize=True)
+                
+                # Create items with metadata
+                items = []
+                for (s, p, o), text in zip(expanded_triplets, texts):
+                    items.append(EmbeddableItem(
+                        text=text,
+                        metadata={
+                            "subject": s,
+                            "predicate": p,
+                            "object": o,
+                            "document": f"({s}, {p}, {o})",
+                            "source": "llm_expanded",
+                            "source_text": "",
+                            "representation_mode": "triplet_text",
+                        }
+                    ))
+                
+                # Add to store
+                self.store.add(embeddings, items)
+                persisted_count = len(items)
+                logger.info(f"Persisted {persisted_count} expanded triplets to Neo4j")
+                
+            except Exception as e:
+                logger.warning(f"Failed to persist expanded triplets: {e}")
+        
+        return json.dumps({
+            "query": query,
+            "existing_facts_count": len(existing_triplets),
+            "expanded_facts_count": len(expanded_facts),
+            "expanded_facts": expanded_facts,
+            "persisted_to_graph": persist_to_graph,
+            "persisted_count": persisted_count,
+        }, ensure_ascii=False)
 
 
 def format_tools_for_prompt(tools: List[Dict] = None) -> str:
