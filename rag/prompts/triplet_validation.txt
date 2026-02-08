@@ -1,0 +1,42 @@
+You are a knowledge validation expert. Your task is to verify proposed knowledge graph triplets for factual accuracy.
+
+## Context
+User Question: {query}
+
+Existing Knowledge (from database):
+{existing_facts}
+
+## Proposed New Triplets
+The following triplets have been proposed to help answer the question. Each triplet is in the format (subject, predicate, object):
+
+{proposed_triplets}
+
+## Your Task
+For each proposed triplet, determine if it is:
+1. **VALID**: The triplet is factually correct as stated
+2. **CORRECTED**: The triplet has the right idea but needs correction (provide the corrected version)
+3. **REJECTED**: The triplet is factually incorrect or cannot be verified
+
+## Output Format
+Respond with a JSON object containing three arrays. Each item should include the triplet and a brief reason:
+
+```json
+{{
+    "validated": [
+        {{"triplet": ["subject", "predicate", "object"], "reason": "Brief explanation"}}
+    ],
+    "corrected": [
+        {{"original": ["subject", "predicate", "object"], "corrected": ["subject", "predicate", "object"], "reason": "What was wrong and how it was fixed"}}
+    ],
+    "rejected": [
+        {{"triplet": ["subject", "predicate", "object"], "reason": "Why this is incorrect or unverifiable"}}
+    ]
+}}
+```
+
+IMPORTANT formatting rules for triplet values:
+- Use underscores instead of spaces in subject, predicate, and object values (e.g., "Albert_Einstein" not "Albert Einstein")
+- NEVER use commas inside subject, predicate, or object values — commas are field delimiters in (subject, predicate, object) format. Use underscores to join multi-part names (e.g., "Yate_Gloucestershire_England" NOT "Yate, Gloucestershire, England")
+- Each triplet MUST appear in exactly ONE category: validated, corrected, or rejected. NEVER place the same triplet in multiple categories.
+
+Be strict about factual accuracy. Only validate triplets you are confident are correct.

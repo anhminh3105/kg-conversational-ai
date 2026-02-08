@@ -19,57 +19,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict, Any
 
-from .prompts import load_prompt, get_prompt_path
+from .prompts import load_prompt
 
 logger = logging.getLogger(__name__)
 
-# Load validation prompt from file, with inline fallback
-def _get_default_validation_template() -> str:
-    """Load the default validation template from file."""
-    try:
-        return load_prompt("triplet_validation")
-    except FileNotFoundError:
-        logger.warning("Validation template not found, using inline fallback")
-        return """You are a knowledge validation expert. Your task is to verify proposed knowledge graph triplets for factual accuracy.
-
-## Context
-User Question: {query}
-
-Existing Knowledge (from database):
-{existing_facts}
-
-## Proposed New Triplets
-The following triplets have been proposed to help answer the question. Each triplet is in the format (subject, predicate, object):
-
-{proposed_triplets}
-
-## Your Task
-For each proposed triplet, determine if it is:
-1. **VALID**: The triplet is factually correct as stated
-2. **CORRECTED**: The triplet has the right idea but needs correction (provide the corrected version)
-3. **REJECTED**: The triplet is factually incorrect or cannot be verified
-
-## Output Format
-Respond with a JSON object containing three arrays. Each item should include the triplet and a brief reason:
-
-```json
-{{
-    "validated": [
-        {{"triplet": ["subject", "predicate", "object"], "reason": "Brief explanation"}}
-    ],
-    "corrected": [
-        {{"original": ["subject", "predicate", "object"], "corrected": ["subject", "predicate", "object"], "reason": "What was wrong and how it was fixed"}}
-    ],
-    "rejected": [
-        {{"triplet": ["subject", "predicate", "object"], "reason": "Why this is incorrect or unverifiable"}}
-    ]
-}}
-```
-
-Be strict about factual accuracy. Only validate triplets you are confident are correct.
-"""
-
-DEFAULT_VALIDATION_TEMPLATE = _get_default_validation_template()
+DEFAULT_VALIDATION_TEMPLATE = load_prompt("triplet_validation")
 
 
 @dataclass
@@ -363,11 +317,34 @@ class TripletValidator:
             local_model=self.local_model_name,
         )
         
-        # Process validated triplets
+        # Process rejected triplets FIRST to build a rejection set.
+        # This ensures that if the remote LLM returns the same triplet in
+        # both 'validated' and 'rejected' arrays (an observed LLM bug),
+        # the rejection takes priority (conservative/safe approach).
+        rejected_keys = set()
+        for item in parsed.get("rejected", []):
+            triplet = item.get("triplet") if isinstance(item, dict) else item
+            normalized = self._normalize_triplet(triplet)
+            if normalized:
+                rejected_keys.add(normalized)
+                result.rejected.append(RejectedTriplet(
+                    subject=normalized[0],
+                    predicate=normalized[1],
+                    object=normalized[2],
+                    reason=item.get("reason", "") if isinstance(item, dict) else "",
+                ))
+        
+        # Process validated triplets, skipping any that were also rejected
         for item in parsed.get("validated", []):
             triplet = item.get("triplet") if isinstance(item, dict) else item
             normalized = self._normalize_triplet(triplet)
             if normalized:
+                if normalized in rejected_keys:
+                    logger.warning(
+                        f"Triplet {normalized} appeared in both 'validated' and "
+                        f"'rejected' arrays from remote LLM. Treating as rejected."
+                    )
+                    continue
                 result.validated.append(ValidatedTriplet(
                     subject=normalized[0],
                     predicate=normalized[1],
@@ -376,12 +353,18 @@ class TripletValidator:
                     reason=item.get("reason", "") if isinstance(item, dict) else "",
                 ))
         
-        # Process corrected triplets
+        # Process corrected triplets, skipping any that were also rejected
         for item in parsed.get("corrected", []):
             if isinstance(item, dict):
                 corrected = self._normalize_triplet(item.get("corrected"))
                 original = self._normalize_triplet(item.get("original"))
                 if corrected:
+                    if corrected in rejected_keys:
+                        logger.warning(
+                            f"Corrected triplet {corrected} was also rejected "
+                            f"by remote LLM. Treating as rejected."
+                        )
+                        continue
                     result.validated.append(ValidatedTriplet(
                         subject=corrected[0],
                         predicate=corrected[1],
@@ -390,18 +373,6 @@ class TripletValidator:
                         reason=item.get("reason", ""),
                         original=original,
                     ))
-        
-        # Process rejected triplets
-        for item in parsed.get("rejected", []):
-            triplet = item.get("triplet") if isinstance(item, dict) else item
-            normalized = self._normalize_triplet(triplet)
-            if normalized:
-                result.rejected.append(RejectedTriplet(
-                    subject=normalized[0],
-                    predicate=normalized[1],
-                    object=normalized[2],
-                    reason=item.get("reason", "") if isinstance(item, dict) else "",
-                ))
         
         logger.info(
             f"Validation complete: {len(result.validated)} accepted, "

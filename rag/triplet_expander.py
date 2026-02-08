@@ -15,39 +15,15 @@ from typing import List, Tuple, Optional, Set
 from pathlib import Path
 
 from .edc.edc.utils.llm_utils import openai_chat_completion
-from .prompts import load_prompt_safe
+from .prompts import load_prompt
 
 logger = logging.getLogger(__name__)
 
 # Default template path (in rag/edc/prompt_templates/)
 DEFAULT_TEMPLATE_PATH = Path(__file__).parent / "edc" / "prompt_templates" / "triplet_expansion.txt"
 
-# Fallback template - load from prompts directory with inline backup
-FALLBACK_EXPANSION_TEMPLATE = load_prompt_safe(
-    "triplet_expansion_fallback",
-    fallback="""You are a knowledge graph expert. Given a user's question and some existing knowledge graph triplets, generate additional relevant triplets that would help answer the question.
-
-=== USER QUESTION ===
-{question}
-
-=== EXISTING TRIPLETS ===
-{existing_triplets}
-
-=== VALID RELATIONS ===
-You may ONLY use the following predicates (relations):
-{schema_relations}
-
-=== INSTRUCTIONS ===
-1. Generate {max_triplets} additional triplets that are relevant to answering the question.
-2. Each triplet must use ONLY predicates from the valid relations list above.
-3. Focus on facts that would directly help answer the user's question.
-4. Use entities that are related to those in the existing triplets.
-5. Format each triplet as: (subject, predicate, object)
-6. Output ONLY the triplets, one per line.
-
-=== ADDITIONAL TRIPLETS ===
-"""
-)
+# Fallback template loaded from rag/prompts/triplet_expansion_fallback.txt
+FALLBACK_EXPANSION_TEMPLATE = load_prompt("triplet_expansion_fallback")
 
 
 class TripletExpander:

@@ -17,5 +17,6 @@ You may ONLY use the following predicates (relations):
 4. Use entities that are related to those in the existing triplets.
 5. Format each triplet as: (subject, predicate, object)
 6. Output ONLY the triplets, one per line.
+7. Use underscores instead of spaces in all values. NEVER use commas inside subject, predicate, or object values — commas are field delimiters. Use underscores to join multi-part names (e.g., "Yate_Gloucestershire_England" NOT "Yate, Gloucestershire, England").
 
 === ADDITIONAL TRIPLETS ===

@@ -67,7 +67,7 @@ from .knowledge_gap_detector import KnowledgeGapDetector, GapAnalysis, get_knowl
 from .triplet_validator import TripletValidator, ValidationResult, ValidatedTriplet, get_triplet_validator
 
 # Prompt loading utilities
-from .prompts import load_prompt, load_prompt_safe, get_prompt_path, list_prompts, clear_cache as clear_prompt_cache
+from .prompts import load_prompt, get_prompt_path, list_prompts, clear_cache as clear_prompt_cache
 
 # Neo4j and MCP components (lazy imports to avoid hard dependency)
 def _get_neo4j_store():
@@ -167,7 +167,6 @@ __all__ = [
     
     # Prompt utilities
     "load_prompt",
-    "load_prompt_safe",
     "get_prompt_path",
     "list_prompts",
     "clear_prompt_cache",

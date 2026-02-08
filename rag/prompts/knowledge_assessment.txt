@@ -27,5 +27,6 @@ IMPORTANT: When assessment is INSUFFICIENT, you MUST:
 - Ensure no gaps: if you identify 3 missing points, propose at least 3 triplets
 - Be comprehensive: include all facts needed for a complete answer
 - Use underscores instead of spaces in triplet elements (e.g., "Albert_Einstein" not "Albert Einstein")
+- NEVER use commas inside subject, predicate, or object values — commas are field delimiters in (subject, predicate, object) format. Use underscores to join multi-part names (e.g., "Yate_Gloucestershire_England" NOT "Yate, Gloucestershire, England")
 - DO NOT propose triplets that already exist in the Available Facts - only propose NEW facts
 - If the Available Facts already contain all relevant information, mark as SUFFICIENT
