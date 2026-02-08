@@ -1,4 +1,4 @@
-You are a knowledge validation expert. Your task is to verify proposed knowledge graph triplets for factual accuracy.
+You are a knowledge validation expert. Your task is to verify proposed knowledge graph triplets for factual accuracy AND specificity.
 
 ## Context
 User Question: {query}
@@ -13,9 +13,35 @@ The following triplets have been proposed to help answer the question. Each trip
 
 ## Your Task
 For each proposed triplet, determine if it is:
-1. **VALID**: The triplet is factually correct as stated
-2. **CORRECTED**: The triplet has the right idea but needs correction (provide the corrected version)
-3. **REJECTED**: The triplet is factually incorrect or cannot be verified
+1. **VALID**: The triplet is factually correct AND contains specific, real-world values
+2. **CORRECTED**: The triplet has the right idea but needs correction (provide the corrected version with REAL values)
+3. **REJECTED**: The triplet is factually incorrect, unverifiable, OR contains vague/placeholder values
+
+## CRITICAL: Reject Vague, Placeholder, and Generic Triplets
+
+You MUST REJECT any triplet where the subject, predicate, OR object contains:
+
+- **Placeholder names**: Stakeholder_Name1, Shareholder_Name2, Person_X, Entity_Name, Some_Value, Name1, Name2, etc.
+- **Numbered templates**: Any value ending in a number that is clearly a template (e.g., Stakeholder_Name1, Partner_3, Investor_2)
+- **Generic type words used as values**: "Entity", "Person", "Organization", "Company", "Individual", "Stakeholder_Entity", "Shareholder_Entity" when used as the actual subject or object (not as a predicate like "type")
+- **Redacted or obscured values**: "[REDACTED]", "Unknown", "N/A", "TBD", "Various", "Multiple", "Several"
+- **Overly abstract values**: Values that could apply to anything and carry no specific information (e.g., "Important_Factor", "Key_Element", "Relevant_Information")
+- **Template-style patterns**: Any value that follows a pattern like "Category_Word" + number or "Role_Descriptor" without a real name
+
+A triplet is only useful if ALL THREE of its components (subject, predicate, object) refer to specific, identifiable, real-world entities, relationships, or values. If the local LLM could not determine the actual name, date, number, or entity, the triplet MUST be rejected — not corrected into another placeholder.
+
+Examples of triplets that MUST be REJECTED:
+- (Advanced_Micro_Devices, hasStakeholder, Stakeholder_Name1) → REJECT: "Stakeholder_Name1" is a placeholder
+- (Advanced_Micro_Devices, hasShareholder, Shareholder_Entity) → REJECT: "Shareholder_Entity" is generic
+- (Company_X, CEO, Person_Name) → REJECT: both subject and object are placeholders
+- (Einstein, wonAward, Important_Award) → REJECT: "Important_Award" is vague
+- (AMD, hasInvestor, Investor_2) → REJECT: numbered template, not a real investor name
+
+Examples of triplets that SHOULD be VALIDATED or CORRECTED:
+- (Advanced_Micro_Devices, CEO, Lisa_Su) → VALID: specific real person
+- (Einstein, wonAward, Nobel_Prize_in_Physics) → VALID: specific real award
+- (Advanced_Micro_Devices, foundedIn, 1969) → VALID: specific real date
+- (Albert_Einstien, bornIn, Ulm) → CORRECTED to (Albert_Einstein, bornIn, Ulm): typo fix, real values
 
 ## Output Format
 Respond with a JSON object containing three arrays. Each item should include the triplet and a brief reason:
@@ -38,5 +64,6 @@ IMPORTANT formatting rules for triplet values:
 - Use underscores instead of spaces in subject, predicate, and object values (e.g., "Albert_Einstein" not "Albert Einstein")
 - NEVER use commas inside subject, predicate, or object values — commas are field delimiters in (subject, predicate, object) format. Use underscores to join multi-part names (e.g., "Yate_Gloucestershire_England" NOT "Yate, Gloucestershire, England")
 - Each triplet MUST appear in exactly ONE category: validated, corrected, or rejected. NEVER place the same triplet in multiple categories.
+- When correcting a triplet, the corrected version MUST contain real, specific values — NEVER correct a placeholder into another placeholder.
 
-Be strict about factual accuracy. Only validate triplets you are confident are correct.
+Be strict about BOTH factual accuracy AND specificity. Reject anything you cannot verify with a concrete, real-world value.

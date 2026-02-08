@@ -30,3 +30,11 @@ IMPORTANT: When assessment is INSUFFICIENT, you MUST:
 - NEVER use commas inside subject, predicate, or object values — commas are field delimiters in (subject, predicate, object) format. Use underscores to join multi-part names (e.g., "Yate_Gloucestershire_England" NOT "Yate, Gloucestershire, England")
 - DO NOT propose triplets that already exist in the Available Facts - only propose NEW facts
 - If the Available Facts already contain all relevant information, mark as SUFFICIENT
+
+CRITICAL — Do NOT propose placeholder or generic triplets:
+- Every subject, predicate, and object MUST be a specific, real-world value that you are confident about
+- NEVER use placeholder names like Stakeholder_Name1, Person_X, Entity_Name, Shareholder_Entity, Name1, etc.
+- NEVER use generic values like "Unknown", "Various", "Important_Factor", "Key_Element"
+- If you do not know the actual specific value for a piece of missing information, do NOT propose a triplet for it — leave it out entirely
+- It is better to propose 2 triplets with real facts than 8 triplets with placeholder values
+- Only propose facts you can state with confidence from your training knowledge

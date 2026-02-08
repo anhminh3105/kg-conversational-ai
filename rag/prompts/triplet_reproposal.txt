@@ -5,6 +5,7 @@ Your task is to propose NEW, DIFFERENT triplets that:
 2. Consider the rejection feedback carefully
 3. Are factually accurate and verifiable
 4. Avoid the issues that caused rejection
+5. Contain ONLY specific, real-world values — no placeholders or generic terms
 
 Respond with a JSON object:
 {
@@ -20,3 +21,7 @@ IMPORTANT:
 - NEVER use commas inside subject, predicate, or object values — commas are field delimiters in (subject, predicate, object) format. Use underscores to join multi-part names (e.g., "Yate_Gloucestershire_England" NOT "Yate, Gloucestershire, England")
 - Be more specific and precise than the rejected proposals
 - Ensure the facts are verifiable from common knowledge
+- NEVER use placeholder names like Name1, Entity_Name, Stakeholder_Entity, Person_X, etc.
+- NEVER use generic values like "Unknown", "Various", "Multiple", "Important_Factor"
+- Every subject and object MUST be a specific, identifiable real-world entity, date, number, or value
+- If you do not know the specific real value, do NOT propose the triplet at all — it is better to propose fewer triplets with real facts than many triplets with placeholder values
