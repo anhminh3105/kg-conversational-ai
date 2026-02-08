@@ -8,9 +8,11 @@ This module provides functionality to:
 4. Store and retrieve from FAISS index or Neo4j database
 5. Retrieve relevant triplets for a query
 5.5. Expand triplets using LLM (optional)
+5.6. Validate triplets with remote LLM (optional, dual-LLM mode)
 6. Build augmented prompts with KG context
 7. Generate answers using local LLM
 8. MCP-enabled agentic queries with Neo4j (optional)
+9. Dual-LLM knowledge expansion with validation (optional)
 
 Usage:
     from rag import KGRagIndexer, KGRagGenerator
@@ -60,6 +62,13 @@ from .triplet_expander import TripletExpander, get_triplet_expander
 from .duplicate_detector import DuplicateDetector, DuplicateCheckResult, get_duplicate_detector
 from .generator import KGRagGenerator, GenerationResult, create_generator
 
+# Knowledge gap detection and validation (for dual-LLM mode)
+from .knowledge_gap_detector import KnowledgeGapDetector, GapAnalysis, get_knowledge_gap_detector
+from .triplet_validator import TripletValidator, ValidationResult, ValidatedTriplet, get_triplet_validator
+
+# Prompt loading utilities
+from .prompts import load_prompt, load_prompt_safe, get_prompt_path, list_prompts, clear_cache as clear_prompt_cache
+
 # Neo4j and MCP components (lazy imports to avoid hard dependency)
 def _get_neo4j_store():
     from .neo4j_store import Neo4jStore
@@ -69,6 +78,10 @@ def _get_mcp_agent():
     from .mcp_agent import MCPAgent, MCPAgentLite, AgentResult, create_mcp_agent
     return MCPAgent, MCPAgentLite, AgentResult, create_mcp_agent
 
+def _get_mcp_agent_with_validation():
+    from .mcp_agent import MCPAgentWithValidation, ValidatedAgentResult, create_mcp_agent_with_validation
+    return MCPAgentWithValidation, ValidatedAgentResult, create_mcp_agent_with_validation
+
 def _get_mcp_tools():
     from .mcp_neo4j_server import Neo4jMCPToolHandler, NEO4J_TOOLS, format_tools_for_prompt
     return Neo4jMCPToolHandler, NEO4J_TOOLS, format_tools_for_prompt
@@ -77,6 +90,11 @@ def _get_mcp_tools():
 def create_mcp_agent(*args, **kwargs):
     """Create an MCP-enabled agent for Neo4j knowledge graph queries."""
     from .mcp_agent import create_mcp_agent as _create
+    return _create(*args, **kwargs)
+
+def create_mcp_agent_with_validation(*args, **kwargs):
+    """Create an MCP agent with dual-LLM validation for knowledge expansion."""
+    from .mcp_agent import create_mcp_agent_with_validation as _create
     return _create(*args, **kwargs)
 
 __all__ = [
@@ -115,6 +133,17 @@ __all__ = [
     "TripletExpander",
     "get_triplet_expander",
     
+    # Knowledge Gap Detection (Step 5.6)
+    "KnowledgeGapDetector",
+    "GapAnalysis",
+    "get_knowledge_gap_detector",
+    
+    # Triplet Validation (Step 5.7 - dual-LLM mode)
+    "TripletValidator",
+    "ValidationResult",
+    "ValidatedTriplet",
+    "get_triplet_validator",
+    
     # Duplicate Detection (for offline persistence)
     "DuplicateDetector",
     "DuplicateCheckResult",
@@ -131,4 +160,15 @@ __all__ = [
     "create_mcp_agent",
     # MCPAgent, MCPAgentLite available via: from rag.mcp_agent import MCPAgent
     # Neo4jMCPToolHandler available via: from rag.mcp_neo4j_server import Neo4jMCPToolHandler
+    
+    # MCP Agent with Validation (Step 9 - dual-LLM knowledge expansion)
+    "create_mcp_agent_with_validation",
+    # MCPAgentWithValidation available via: from rag.mcp_agent import MCPAgentWithValidation
+    
+    # Prompt utilities
+    "load_prompt",
+    "load_prompt_safe",
+    "get_prompt_path",
+    "list_prompts",
+    "clear_prompt_cache",
 ]

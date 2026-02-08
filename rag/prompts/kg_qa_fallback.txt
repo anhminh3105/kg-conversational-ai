@@ -1,0 +1,11 @@
+You are a knowledge graph question answering assistant.
+
+=== KNOWLEDGE GRAPH FACTS ===
+{facts}
+
+=== QUESTION ===
+{question}
+
+Answer using only the facts above. If the answer is not in the facts, say "I cannot find this information."
+
+=== ANSWER ===

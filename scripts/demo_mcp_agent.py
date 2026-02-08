@@ -8,6 +8,7 @@ This script demonstrates the full pipeline:
 3. Run agentic queries that use MCP tools to query the knowledge graph
 4. Show tool call traces and final answers
 5. Demonstrate triplet expansion to enrich sparse knowledge graphs
+6. Demonstrate dual-LLM validation workflow (local proposal + remote validation)
 
 Prerequisites:
 - Neo4j running at bolt://localhost:7687
@@ -38,6 +39,13 @@ Usage:
     
     # Run simple search demo (no LLM required)
     python scripts/demo_mcp_agent.py --simple
+    
+    # Run dual-LLM validated expansion demo (requires remote LLM config)
+    # First configure: source export_dual_llm.sh
+    python scripts/demo_mcp_agent.py --validated-expand
+    
+    # Run validated expansion with verbose output
+    python scripts/demo_mcp_agent.py --validated-expand --verbose
 """
 
 import argparse
@@ -351,6 +359,205 @@ def run_triplet_expansion_demo(
     print("=" * 60)
 
 
+def run_validated_expansion_demo(
+    neo4j_uri: str,
+    neo4j_user: str,
+    neo4j_password: str,
+    verbose: bool = False,
+    query: str = None,
+):
+    """
+    Demonstrate the dual-LLM validated expansion workflow with detailed intermediate messages.
+    
+    This demo shows the complete workflow:
+    1. Query the knowledge graph for relevant facts
+    2. LLM assesses if facts are sufficient (with complete triplet proposals)
+    3. If insufficient, shows detailed gap detection message with proposed triplets
+    4. Validates with remote LLM (with retry mechanism up to 3 attempts)
+    5. Shows validation attempt results for each attempt
+    6. Persists validated triplets and shows confirmation
+    7. Handles graceful failure if all attempts fail
+    
+    Prerequisites:
+        - Configure dual-LLM mode: source export_dual_llm.sh
+        - Or configure REMOTE_LLM_* environment variables
+    """
+    import json
+    
+    print("\n" + "=" * 60)
+    print("Dual-LLM Validated Expansion Demo (with LLM-based Assessment)")
+    print("=" * 60)
+    
+    # Check if remote LLM is configured
+    from rag.edc.edc.utils.llm_utils import is_remote_llm_configured, get_remote_model_name
+    
+    if not is_remote_llm_configured():
+        print("\n  ERROR: Remote LLM not configured!")
+        print("\n  To use validated expansion, configure a remote LLM:")
+        print("    1. Run: source export_dual_llm.sh")
+        print("    2. Edit the script to add your API key")
+        print("    3. Or set REMOTE_LLM_API_KEY and REMOTE_LLM_MODEL environment variables")
+        print("\n  Alternatively, you can use:")
+        print("    - source export_google_ai.sh  (uses Google AI Studio)")
+        print("    - source export_sambanova.sh  (uses SambaNova)")
+        return
+    
+    print(f"\n[1] Configuration")
+    print("-" * 40)
+    local_model = os.environ.get("LOCAL_LLM_MODEL", "API-based")
+    remote_model = get_remote_model_name()
+    max_validation_retries = 3
+    max_knowledge_iterations = 3
+    print(f"  Local LLM (assessment + proposals): {local_model}")
+    print(f"  Remote LLM (validation):            {remote_model}")
+    print(f"  Max validation retries:             {max_validation_retries}")
+    print(f"  Max knowledge iterations:           {max_knowledge_iterations}")
+    
+    # Create the agent with validation
+    print(f"\n[2] Creating MCPAgentWithValidation")
+    print("-" * 40)
+    
+    from rag.mcp_agent import create_mcp_agent_with_validation
+    
+    agent = create_mcp_agent_with_validation(
+        neo4j_uri=neo4j_uri,
+        neo4j_user=neo4j_user,
+        neo4j_password=neo4j_password,
+        enable_validation=True,
+        auto_expand=True,
+        max_validation_retries=max_validation_retries,
+        max_knowledge_iterations=max_knowledge_iterations,
+    )
+    
+    print("  Agent created successfully!")
+    
+    # Demo queries that are likely to trigger expansion
+    demo_queries = [
+        query if query else "What awards and achievements is Einstein known for?",
+    ]
+    
+    print(f"\n[3] Running Demo Queries with LLM-Based Assessment & Validated Expansion")
+    print("-" * 40)
+    
+    for i, q in enumerate(demo_queries, 1):
+        print(f"\n{'='*60}")
+        print(f"Query {i}: {q}")
+        print("="*60)
+        
+        try:
+            # Run with verbose=True to see intermediate messages in real-time
+            # When verbose=False, we'll display them from the result
+            result = agent.run(q, verbose=verbose, force_expand=True)
+            
+            # If not verbose, display intermediate messages from result
+            if not verbose and result.intermediate_messages:
+                print("\n--- Intermediate Messages (Process Log) ---")
+                for msg in result.intermediate_messages:
+                    print(msg)
+            
+            # Display LLM Assessment details
+            if result.llm_assessment:
+                print(f"\n--- LLM Assessment Details ---")
+                assessment = result.llm_assessment
+                print(f"  Assessment: {assessment.get('assessment', 'N/A')}")
+                print(f"  Confidence: {assessment.get('confidence', 0):.2f}")
+                
+                if assessment.get('missing_information'):
+                    print(f"  Missing information ({len(assessment['missing_information'])} items):")
+                    for item in assessment['missing_information']:
+                        print(f"    - {item}")
+                
+                if assessment.get('answer'):
+                    partial = assessment['answer'][:100] + "..." if len(assessment.get('answer', '')) > 100 else assessment['answer']
+                    print(f"  Partial answer: {partial}")
+            
+            # Display validation statistics
+            print(f"\n--- Validation Summary ---")
+            print(f"  Knowledge iterations: {result.knowledge_iterations}")
+            print(f"  Knowledge gap detected: {result.knowledge_gap_detected}")
+            print(f"  Validation attempts: {result.validation_attempts}")
+            print(f"  Validation failed: {result.validation_failed}")
+            
+            if result.proposed_triplets:
+                print(f"\n--- Proposed Triplets (Local LLM) ---")
+                print(f"  Count: {len(result.proposed_triplets)}")
+                for t in result.proposed_triplets:
+                    print(f"    + {t}")
+            
+            if result.validated_triplets:
+                print(f"\n--- Validated Triplets (Remote LLM) ---")
+                print(f"  Count: {len(result.validated_triplets)}")
+                for vt in result.validated_triplets:
+                    status = vt.get('status', 'unknown')
+                    triplet = vt.get('triplet', '')
+                    reason = vt.get('reason', '')
+                    print(f"    [{status}] {triplet}")
+                    if reason:
+                        print(f"            Reason: {reason}")
+            
+            if result.rejected_triplets:
+                print(f"\n--- Rejected Triplets (All Attempts) ---")
+                print(f"  Count: {len(result.rejected_triplets)}")
+                for rt in result.rejected_triplets:
+                    triplet = rt.get('triplet', '')
+                    reason = rt.get('reason', '')
+                    print(f"    [rejected] {triplet}")
+                    if reason:
+                        print(f"               Reason: {reason}")
+            
+            # Display validation history if available
+            if result.validation_history:
+                print(f"\n--- Validation History ---")
+                for vh in result.validation_history:
+                    attempt = vh.get('attempt', '?')
+                    all_rejected = vh.get('all_rejected', False)
+                    validated = vh.get('validated', [])
+                    rejected = vh.get('rejected', [])
+                    status = "ALL REJECTED" if all_rejected else f"{len(validated)} accepted"
+                    print(f"  Attempt {attempt}: {status}, {len(rejected)} rejected")
+            
+            if result.persisted_count > 0:
+                print(f"\n--- Persistence ---")
+                print(f"  Persisted {result.persisted_count} new triplets to Neo4j")
+            
+            print(f"\n--- Final Answer ---")
+            print(result.answer)
+            
+            print(f"\n--- Tool Calls Summary ---")
+            print(f"  Total iterations: {result.iterations}")
+            for tc in result.tool_calls:
+                tool = tc.get('tool', '')
+                args_preview = str(tc.get('arguments', {}))[:50]
+                print(f"    [{tc.get('iteration')}] {tool}({args_preview}...)")
+            
+            if result.warning:
+                print(f"\n  Warning: {result.warning}")
+                
+        except Exception as e:
+            print(f"ERROR: {e}")
+            if verbose:
+                import traceback
+                traceback.print_exc()
+    
+    print("\n" + "=" * 60)
+    print("Dual-LLM Validated Expansion Demo Complete!")
+    print("=" * 60)
+    print("\nSummary of Features:")
+    print("  - LLM-based knowledge gap assessment (instead of heuristics)")
+    print("  - Complete triplet coverage: LLM proposes facts for ALL missing info")
+    print("  - ITERATIVE knowledge expansion:")
+    print("      * Search KB -> Assess -> Propose -> Validate -> Persist")
+    print("      * Re-search with new facts and re-assess")
+    print("      * Repeat until knowledge is sufficient or max iterations")
+    print("  - Detailed intermediate messages showing:")
+    print("      * Gap detection with proposed triplets")
+    print("      * Each validation attempt with remote LLM response")
+    print("      * Iteration summaries with progress")
+    print("      * Persistence confirmation")
+    print("  - Up to 3 retry attempts per iteration with feedback loop")
+    print("  - Graceful failure handling if validation cannot succeed")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Demo MCP Agent with Neo4j Knowledge Graph",
@@ -397,6 +604,17 @@ def main():
         action="store_true",
         help="Persist expanded triplets to Neo4j (use with --expand)"
     )
+    parser.add_argument(
+        "--validated-expand",
+        action="store_true",
+        help="Run dual-LLM validated expansion demo (requires remote LLM config)"
+    )
+    parser.add_argument(
+        "--query", "-q",
+        type=str,
+        default=None,
+        help="Custom query for demos (optional)"
+    )
     
     args = parser.parse_args()
     
@@ -415,7 +633,16 @@ def main():
         print("Please ensure Neo4j is running and try again.")
         sys.exit(1)
     
-    if args.expand:
+    if args.validated_expand:
+        # Run dual-LLM validated expansion demo
+        run_validated_expansion_demo(
+            args.neo4j_uri,
+            args.neo4j_user,
+            neo4j_password,
+            verbose=args.verbose,
+            query=args.query,
+        )
+    elif args.expand:
         # Run triplet expansion demo
         run_triplet_expansion_demo(
             args.neo4j_uri,

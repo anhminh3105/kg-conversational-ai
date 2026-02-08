@@ -150,6 +150,43 @@ NEO4J_TOOLS = [
                 "required": ["query", "existing_facts"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_and_persist_triplets",
+            "description": "Validate proposed triplets using a remote LLM and persist validated ones to the knowledge graph. Use this when you want to expand the knowledge base with verified facts. The remote LLM checks factual accuracy and can correct minor errors.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The user's question that prompted the triplet generation"
+                    },
+                    "proposed_triplets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of proposed triplets in format '(subject, predicate, object)'"
+                    },
+                    "existing_facts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of existing facts from the knowledge graph for context"
+                    },
+                    "persist_validated": {
+                        "type": "boolean",
+                        "description": "Whether to persist validated triplets to the graph (default: true)",
+                        "default": True
+                    },
+                    "skip_validation": {
+                        "type": "boolean",
+                        "description": "Skip remote validation and directly persist triplets (use for already-validated triplets)",
+                        "default": False
+                    }
+                },
+                "required": ["query", "proposed_triplets"]
+            }
+        }
     }
 ]
 
@@ -174,6 +211,8 @@ class Neo4jMCPToolHandler:
         embedder: Embedder instance for semantic search
         allow_cypher: Whether to allow raw Cypher queries (security consideration)
         triplet_expander: Optional TripletExpander for generating new triplets
+        triplet_validator: Optional TripletValidator for remote LLM validation
+        enable_validation: Whether remote validation is enabled
     """
     
     def __init__(
@@ -182,7 +221,9 @@ class Neo4jMCPToolHandler:
         embedder,
         allow_cypher: bool = True,
         enable_expansion: bool = True,
+        enable_validation: bool = True,
         schema_path: Optional[str] = None,
+        local_model_name: str = "local_llm",
     ):
         """
         Initialize the tool handler.
@@ -192,12 +233,16 @@ class Neo4jMCPToolHandler:
             embedder: Embedder instance for generating query embeddings
             allow_cypher: Whether to allow raw Cypher queries
             enable_expansion: Whether to enable triplet expansion tool
+            enable_validation: Whether to enable remote LLM validation
             schema_path: Optional path to schema CSV for triplet expansion
+            local_model_name: Name of the local LLM (for metadata tracking)
         """
         self.store = neo4j_store
         self.embedder = embedder
         self.allow_cypher = allow_cypher
         self.enable_expansion = enable_expansion
+        self.enable_validation = enable_validation
+        self.local_model_name = local_model_name
         
         # Initialize triplet expander if enabled
         self.triplet_expander = None
@@ -210,7 +255,29 @@ class Neo4jMCPToolHandler:
                 logger.warning(f"Failed to initialize triplet expander: {e}")
                 self.enable_expansion = False
         
-        logger.info(f"Initialized Neo4jMCPToolHandler (cypher={allow_cypher}, expansion={enable_expansion})")
+        # Initialize triplet validator if enabled
+        self.triplet_validator = None
+        if enable_validation:
+            try:
+                from .triplet_validator import get_triplet_validator
+                from .edc.edc.utils.llm_utils import is_remote_llm_configured
+                
+                if is_remote_llm_configured():
+                    self.triplet_validator = get_triplet_validator(
+                        local_model_name=local_model_name
+                    )
+                    logger.info("Triplet validation enabled (remote LLM configured)")
+                else:
+                    logger.warning("Remote LLM not configured - validation disabled")
+                    self.enable_validation = False
+            except Exception as e:
+                logger.warning(f"Failed to initialize triplet validator: {e}")
+                self.enable_validation = False
+        
+        logger.info(
+            f"Initialized Neo4jMCPToolHandler "
+            f"(cypher={allow_cypher}, expansion={enable_expansion}, validation={enable_validation})"
+        )
     
     def get_tools(self, include_cypher: bool = None) -> List[Dict]:
         """
@@ -288,6 +355,20 @@ class Neo4jMCPToolHandler:
                     arguments["existing_facts"],
                     arguments.get("max_new_triplets", 5),
                     arguments.get("persist_to_graph", False),
+                )
+            
+            elif tool_name == "validate_and_persist_triplets":
+                skip_validation = arguments.get("skip_validation", False)
+                if not self.enable_validation and not skip_validation:
+                    return json.dumps({
+                        "error": "Triplet validation is not enabled. Configure remote LLM first."
+                    })
+                return self._validate_and_persist_triplets(
+                    arguments["query"],
+                    arguments["proposed_triplets"],
+                    arguments.get("existing_facts", []),
+                    arguments.get("persist_validated", True),
+                    skip_validation=skip_validation,
                 )
             
             else:
@@ -576,6 +657,167 @@ class Neo4jMCPToolHandler:
             "persisted_to_graph": persist_to_graph,
             "persisted_count": persisted_count,
         }, ensure_ascii=False)
+    
+    def _validate_and_persist_triplets(
+        self,
+        query: str,
+        proposed_triplets: List[str],
+        existing_facts: List[str],
+        persist_validated: bool,
+        skip_validation: bool = False,
+    ) -> str:
+        """
+        Validate proposed triplets using remote LLM and persist validated ones.
+        
+        This implements the dual-LLM validation workflow:
+        1. Parse proposed triplets from local LLM
+        2. Send to remote LLM for factual verification (unless skip_validation=True)
+        3. Persist validated/corrected triplets to Neo4j
+        4. Return validation report
+        
+        Args:
+            query: User's original question
+            proposed_triplets: List of triplet strings from local LLM
+            existing_facts: Existing facts from the knowledge graph
+            persist_validated: Whether to persist validated triplets
+            skip_validation: Skip remote validation (for already-validated triplets)
+            
+        Returns:
+            JSON string with validation report
+        """
+        import re
+        from datetime import datetime
+        from .triplet_validator import ValidatedTriplet, ValidationResult
+        
+        # Parse proposed triplets
+        triplet_pattern = r'\(([^,]+),\s*([^,]+),\s*([^)]+)\)'
+        parsed_triplets = []
+        
+        for fact in proposed_triplets:
+            match = re.search(triplet_pattern, fact)
+            if match:
+                s = match.group(1).strip().replace(" ", "_")
+                p = match.group(2).strip().replace(" ", "_")
+                o = match.group(3).strip().replace(" ", "_")
+                parsed_triplets.append((s, p, o))
+        
+        if not parsed_triplets:
+            return json.dumps({
+                "error": "No valid triplets provided. Format: (subject, predicate, object)",
+                "query": query,
+            })
+        
+        # Skip validation if requested (for already-validated triplets)
+        if skip_validation:
+            # Create a mock validation result with all triplets accepted
+            validated_list = [
+                ValidatedTriplet(
+                    subject=s,
+                    predicate=p,
+                    object=o,
+                    status="validated",
+                    reason="Pre-validated triplet (skipped re-validation)",
+                )
+                for s, p, o in parsed_triplets
+            ]
+            validation_result = ValidationResult(
+                validated=validated_list,
+                rejected=[],
+                query=query,
+                timestamp=datetime.now().isoformat(),
+                remote_model="skipped",
+                local_model=self.local_model_name,
+            )
+            logger.info(f"Skipped validation for {len(parsed_triplets)} pre-validated triplets")
+        else:
+            # Validate with remote LLM
+            try:
+                validation_result = self.triplet_validator.validate(
+                    proposed_triplets=parsed_triplets,
+                    query=query,
+                    existing_facts=existing_facts,
+                )
+            except Exception as e:
+                logger.error(f"Validation failed: {e}")
+                return json.dumps({
+                    "error": f"Validation failed: {str(e)}",
+                    "query": query,
+                })
+        
+        # Persist validated triplets if requested
+        persisted_count = 0
+        if persist_validated and validation_result.accepted_triplets:
+            try:
+                from .representation import EmbeddableItem
+                import numpy as np
+                
+                # Generate embeddings for validated triplets
+                texts = [
+                    f"{s.replace('_', ' ')} {p.replace('_', ' ')} {o.replace('_', ' ')}"
+                    for s, p, o in validation_result.accepted_triplets
+                ]
+                embeddings = self.embedder.embed_texts(texts, normalize=True)
+                
+                # Create items with metadata (including validation info)
+                items = []
+                for validated, text in zip(validation_result.validated, texts):
+                    metadata = {
+                        "subject": validated.subject,
+                        "predicate": validated.predicate,
+                        "object": validated.object,
+                        "document": f"({validated.subject}, {validated.predicate}, {validated.object})",
+                        "source": "remote_validated",
+                        "source_text": "",
+                        "representation_mode": "triplet_text",
+                        "validation_status": validated.status,
+                        "validation_reason": validated.reason,
+                        "validated_at": datetime.now().isoformat(),
+                        "local_llm": self.local_model_name,
+                        "remote_llm": validation_result.remote_model,
+                    }
+                    
+                    # Add original if this was corrected
+                    if validated.original:
+                        metadata["original_proposal"] = f"({validated.original[0]}, {validated.original[1]}, {validated.original[2]})"
+                    
+                    items.append(EmbeddableItem(text=text, metadata=metadata))
+                
+                # Add to store
+                self.store.add(embeddings, items)
+                persisted_count = len(items)
+                logger.info(f"Persisted {persisted_count} validated triplets to Neo4j")
+                
+            except Exception as e:
+                logger.warning(f"Failed to persist validated triplets: {e}")
+        
+        # Build response
+        response = {
+            "query": query,
+            "proposed_count": len(parsed_triplets),
+            "validated_count": len(validation_result.validated),
+            "rejected_count": len(validation_result.rejected),
+            "persisted_count": persisted_count,
+            "remote_model": validation_result.remote_model,
+            "validated_triplets": [
+                {
+                    "triplet": f"({v.subject}, {v.predicate}, {v.object})",
+                    "status": v.status,
+                    "reason": v.reason,
+                    "original": f"({v.original[0]}, {v.original[1]}, {v.original[2]})" if v.original else None,
+                }
+                for v in validation_result.validated
+            ],
+            "rejected_triplets": [
+                {
+                    "triplet": f"({r.subject}, {r.predicate}, {r.object})",
+                    "reason": r.reason,
+                }
+                for r in validation_result.rejected
+            ],
+            "user_notification": validation_result.get_user_notification(),
+        }
+        
+        return json.dumps(response, ensure_ascii=False)
 
 
 def format_tools_for_prompt(tools: List[Dict] = None) -> str:

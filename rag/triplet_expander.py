@@ -15,14 +15,17 @@ from typing import List, Tuple, Optional, Set
 from pathlib import Path
 
 from .edc.edc.utils.llm_utils import openai_chat_completion
+from .prompts import load_prompt_safe
 
 logger = logging.getLogger(__name__)
 
 # Default template path (in rag/edc/prompt_templates/)
 DEFAULT_TEMPLATE_PATH = Path(__file__).parent / "edc" / "prompt_templates" / "triplet_expansion.txt"
 
-# Fallback template if file not found
-FALLBACK_EXPANSION_TEMPLATE = """You are a knowledge graph expert. Given a user's question and some existing knowledge graph triplets, generate additional relevant triplets that would help answer the question.
+# Fallback template - load from prompts directory with inline backup
+FALLBACK_EXPANSION_TEMPLATE = load_prompt_safe(
+    "triplet_expansion_fallback",
+    fallback="""You are a knowledge graph expert. Given a user's question and some existing knowledge graph triplets, generate additional relevant triplets that would help answer the question.
 
 === USER QUESTION ===
 {question}
@@ -44,6 +47,7 @@ You may ONLY use the following predicates (relations):
 
 === ADDITIONAL TRIPLETS ===
 """
+)
 
 
 class TripletExpander:

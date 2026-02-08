@@ -32,6 +32,8 @@ import re
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
+from .prompts import load_prompt
+
 logger = logging.getLogger(__name__)
 
 
@@ -268,31 +270,7 @@ class MCPAgent:
         tools = self.tool_handler.get_tools()
         tools_json = json.dumps(tools, indent=2)
         
-        return f"""You are a helpful knowledge graph assistant. You have access to tools to query a knowledge graph database.
-
-## Available Tools
-
-{tools_json}
-
-## Instructions
-
-1. When the user asks a question, decide if you need to query the knowledge graph.
-2. To call a tool, respond with a JSON object in this exact format:
-   {{"tool": "tool_name", "arguments": {{"param1": "value1", "param2": "value2"}}}}
-3. After receiving tool results, either:
-   - Call another tool if you need more information
-   - Provide a final answer based on the gathered information
-4. When providing a final answer, respond naturally without JSON - just answer the question directly.
-
-## Tips
-
-- Use `search_knowledge_graph` when you need to find information but don't know exact entity names
-- Use `query_entity` when you know the specific entity you want to learn about
-- Use `expand_entity` to discover related information and connections
-- Always base your answers on the facts retrieved from the knowledge graph
-- If no relevant facts are found, say so honestly
-
-Respond concisely and accurately based on the knowledge graph data."""
+        return load_prompt("mcp_agent_system", tools_json=tools_json)
     
     def _generate(
         self,
@@ -625,13 +603,7 @@ class MCPAgentLite:
         
         tools_text = format_tools_for_prompt(self.tool_handler.get_tools())
         
-        return f"""You are a knowledge graph assistant with access to tools.
-
-{tools_text}
-
-To call a tool, respond with JSON: {{"tool": "tool_name", "arguments": {{...}}}}
-After receiving results, provide a clear answer based on the facts found.
-If you don't need a tool, answer directly."""
+        return load_prompt("mcp_agent_lite_system", tools_text=tools_text)
     
     def _parse_tool_call(self, response: str) -> Optional[Dict]:
         """Extract tool call from response."""
@@ -652,6 +624,1177 @@ If you don't need a tool, answer directly."""
                     continue
         
         return None
+
+
+@dataclass
+class ValidatedAgentResult(AgentResult):
+    """Result from an agent run with validation support."""
+    knowledge_gap_detected: bool = False
+    proposed_triplets: List[str] = field(default_factory=list)
+    validated_triplets: List[Dict[str, Any]] = field(default_factory=list)
+    rejected_triplets: List[Dict[str, Any]] = field(default_factory=list)
+    persisted_count: int = 0
+    new_facts_notification: str = ""
+    # New fields for detailed intermediate messaging
+    intermediate_messages: List[str] = field(default_factory=list)
+    llm_assessment: Dict[str, Any] = field(default_factory=dict)
+    validation_failed: bool = False
+    validation_attempts: int = 0
+    validation_history: List[Dict[str, Any]] = field(default_factory=list)
+    # Iterative knowledge expansion tracking
+    knowledge_iterations: int = 1  # Number of search-assess-expand cycles completed
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        result = super().to_dict()
+        result.update({
+            "knowledge_gap_detected": self.knowledge_gap_detected,
+            "proposed_triplets": self.proposed_triplets,
+            "validated_triplets": self.validated_triplets,
+            "rejected_triplets": self.rejected_triplets,
+            "persisted_count": self.persisted_count,
+            "new_facts_notification": self.new_facts_notification,
+            "intermediate_messages": self.intermediate_messages,
+            "llm_assessment": self.llm_assessment,
+            "validation_failed": self.validation_failed,
+            "validation_attempts": self.validation_attempts,
+            "validation_history": self.validation_history,
+            "knowledge_iterations": self.knowledge_iterations,
+        })
+        return result
+
+
+class MCPAgentWithValidation:
+    """
+    MCP Agent with dual-LLM validation for knowledge expansion.
+    
+    This agent implements the complete workflow:
+    1. Query the knowledge graph for relevant facts
+    2. Detect if there's a knowledge gap (insufficient facts)
+    3. If gap detected, use local LLM to propose new triplets
+    4. Send proposed triplets to remote LLM for validation
+    5. Persist validated/corrected triplets to Neo4j
+    6. Generate final answer with notification about new facts
+    
+    Usage:
+        agent = MCPAgentWithValidation(neo4j_store, embedder)
+        result = agent.run("What awards did Einstein win?")
+        
+        print(result.answer)
+        print(result.new_facts_notification)  # Shows newly added facts
+    """
+    
+    def __init__(
+        self,
+        neo4j_store,
+        embedder,
+        max_iterations: int = 5,
+        allow_cypher: bool = False,
+        enable_validation: bool = True,
+        auto_expand: bool = True,
+        max_validation_retries: int = 3,
+        max_knowledge_iterations: int = 3,
+        local_model_name: str = "local_llm",
+    ):
+        """
+        Initialize the agent with validation support.
+        
+        This agent uses an LLM-based approach to detect knowledge gaps
+        (instead of heuristics) and includes a retry mechanism for
+        validation with remote LLM feedback.
+        
+        Args:
+            neo4j_store: Neo4jStore instance
+            embedder: Embedder instance for semantic search
+            max_iterations: Maximum tool call iterations
+            allow_cypher: Whether to allow raw Cypher queries
+            enable_validation: Whether to enable remote validation
+            auto_expand: Whether to automatically expand when gaps detected
+            max_validation_retries: Maximum retries for validation (default: 3)
+            max_knowledge_iterations: Maximum search-assess-expand cycles (default: 3)
+            local_model_name: Name of the local LLM for tracking
+        """
+        from .mcp_neo4j_server import Neo4jMCPToolHandler
+        
+        self.neo4j_store = neo4j_store
+        self.embedder = embedder
+        self.max_iterations = max_iterations
+        self.auto_expand = auto_expand
+        self.max_validation_retries = max_validation_retries
+        self.max_knowledge_iterations = max_knowledge_iterations
+        self.local_model_name = local_model_name
+        
+        # Initialize tool handler with validation enabled
+        self.tool_handler = Neo4jMCPToolHandler(
+            neo4j_store,
+            embedder,
+            allow_cypher=allow_cypher,
+            enable_expansion=True,
+            enable_validation=enable_validation,
+            local_model_name=local_model_name,
+        )
+        
+        logger.info(
+            f"Initialized MCPAgentWithValidation "
+            f"(validation={enable_validation}, auto_expand={auto_expand}, "
+            f"max_retries={max_validation_retries}, max_knowledge_iterations={max_knowledge_iterations})"
+        )
+    
+    def run(
+        self,
+        query: str,
+        temperature: float = 0.1,
+        max_tokens: int = 512,
+        verbose: bool = False,
+        force_expand: bool = False,
+    ) -> ValidatedAgentResult:
+        """
+        Run the agent with iterative knowledge expansion.
+        
+        This method implements an iterative workflow:
+        1. Search the knowledge graph for relevant facts
+        2. Use local LLM to assess if facts are sufficient
+        3. If insufficient, propose triplets and validate with remote LLM
+        4. Persist validated triplets and re-search
+        5. Repeat until sufficient knowledge or max iterations reached
+        6. Generate final answer with all accumulated facts
+        
+        Args:
+            query: User question
+            temperature: LLM sampling temperature
+            max_tokens: Maximum tokens per step
+            verbose: Print intermediate steps
+            force_expand: Force triplet expansion even without detected gap
+            
+        Returns:
+            ValidatedAgentResult with answer, validation info, intermediate messages, and new facts
+        """
+        from .edc.edc.utils.llm_utils import openai_chat_completion
+        
+        logger.info(f"Agent running for query: {query}")
+        
+        # Initialize tracking variables for cumulative results across all iterations
+        tool_calls_log = []
+        intermediate_messages = []
+        all_validation_history = []
+        all_proposed_triplets = []
+        all_validated_triplets = []
+        all_rejected_triplets = []
+        total_persisted_count = 0
+        new_facts_notification = ""
+        llm_assessment = {}
+        validation_failed = False
+        total_validation_attempts = 0
+        knowledge_iterations_completed = 0
+        
+        # Track all known facts (from search + validated) to avoid re-proposing
+        all_known_fact_strings = set()
+        
+        # Helper function for triplet normalization (used across iterations)
+        def normalize_triplet_string(s: str) -> str:
+            """Normalize a triplet string for comparison."""
+            return s.lower().replace(" ", "").replace("_", "").replace("(", "").replace(")", "").replace(",", "|")
+        
+        # ============================================================
+        # ITERATIVE KNOWLEDGE EXPANSION LOOP
+        # ============================================================
+        for knowledge_iteration in range(1, self.max_knowledge_iterations + 1):
+            knowledge_iterations_completed = knowledge_iteration
+            
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"KNOWLEDGE ITERATION {knowledge_iteration}/{self.max_knowledge_iterations}")
+                print(f"{'='*60}")
+            
+            # ----------------------------------------------------------
+            # Step 1: Search knowledge graph
+            # ----------------------------------------------------------
+            if verbose:
+                print(f"\n--- Iteration {knowledge_iteration}, Step 1: Searching knowledge graph ---")
+            
+            search_result = self.tool_handler.handle_tool_call(
+                "search_knowledge_graph",
+                {"query": query, "top_k": 10}
+            )
+            search_data = json.loads(search_result)
+            
+            tool_calls_log.append({
+                "iteration": len(tool_calls_log) + 1,
+                "knowledge_iteration": knowledge_iteration,
+                "tool": "search_knowledge_graph",
+                "arguments": {"query": query, "top_k": 10},
+                "result": search_data,
+            })
+            
+            if verbose:
+                print(f"Found {search_data.get('num_results', 0)} facts")
+            
+            # Extract facts for assessment
+            existing_fact_strings = []
+            for fact in search_data.get("facts", []):
+                fact_str = fact.get("fact", "")
+                existing_fact_strings.append(fact_str)
+                all_known_fact_strings.add(normalize_triplet_string(fact_str))
+            
+            # ----------------------------------------------------------
+            # Step 2: LLM-based knowledge sufficiency assessment
+            # ----------------------------------------------------------
+            if verbose:
+                print(f"\n--- Iteration {knowledge_iteration}, Step 2: LLM Assessing Knowledge Sufficiency ---")
+            
+            llm_assessment = self._assess_knowledge_sufficiency(
+                query, existing_fact_strings, temperature
+            )
+            
+            # On first iteration or if forced, respect force_expand
+            knowledge_gap_detected = llm_assessment["assessment"] == "INSUFFICIENT"
+            if knowledge_iteration == 1 and force_expand:
+                knowledge_gap_detected = True
+            
+            if verbose:
+                print(f"Assessment: {llm_assessment['assessment']} (confidence: {llm_assessment['confidence']:.2f})")
+                if knowledge_gap_detected:
+                    print(f"Missing information: {len(llm_assessment.get('missing_information', []))} items")
+                    print(f"Proposed triplets: {len(llm_assessment.get('proposed_triplets', []))}")
+            
+            # ----------------------------------------------------------
+            # Check if we can answer now (SUFFICIENT)
+            # ----------------------------------------------------------
+            if not knowledge_gap_detected:
+                if verbose:
+                    print(f"\n[Iteration {knowledge_iteration}] Knowledge is SUFFICIENT - proceeding to answer generation")
+                break
+            
+            # ----------------------------------------------------------
+            # Step 3: If gap detected, propose and validate triplets
+            # ----------------------------------------------------------
+            if not self.auto_expand:
+                if verbose:
+                    print(f"\n[Iteration {knowledge_iteration}] Auto-expand disabled - proceeding to answer generation")
+                break
+            
+            proposed_triplets = llm_assessment.get("proposed_triplets", [])
+            
+            # Deduplicate: Remove triplets that already exist OR were previously proposed/validated
+            if proposed_triplets:
+                original_count = len(proposed_triplets)
+                
+                unique_triplets = []
+                for triplet in proposed_triplets:
+                    if isinstance(triplet, (list, tuple)) and len(triplet) >= 3:
+                        triplet_str = f"{triplet[0]}|{triplet[1]}|{triplet[2]}"
+                        normalized = normalize_triplet_string(triplet_str)
+                        if normalized not in all_known_fact_strings:
+                            unique_triplets.append(triplet)
+                            # Add to known facts to prevent re-proposing in future iterations
+                            all_known_fact_strings.add(normalized)
+                        else:
+                            logger.info(f"Skipping duplicate triplet (already known): {triplet}")
+                
+                proposed_triplets = unique_triplets
+                
+                if verbose and original_count != len(proposed_triplets):
+                    print(f"  Filtered out {original_count - len(proposed_triplets)} duplicate triplets")
+                
+                llm_assessment["proposed_triplets"] = proposed_triplets
+            
+            # If no new triplets to propose, we can't make progress
+            if not proposed_triplets:
+                if verbose:
+                    print(f"\n[Iteration {knowledge_iteration}] No new triplets to propose - proceeding to answer generation")
+                break
+            
+            # Track all proposed triplets
+            all_proposed_triplets.extend([str(t) for t in proposed_triplets])
+            
+            # Generate and show gap detection message
+            gap_message = self._generate_gap_detection_message(llm_assessment)
+            intermediate_messages.append(gap_message)
+            if verbose:
+                print(gap_message)
+            
+            # ----------------------------------------------------------
+            # Step 4: Validate with retry mechanism
+            # ----------------------------------------------------------
+            if not self.tool_handler.enable_validation:
+                if verbose:
+                    print(f"\n[Iteration {knowledge_iteration}] Validation disabled - proceeding to answer generation")
+                break
+            
+            validated_triplets, success, failure_msg, validation_history = self._validate_with_retry(
+                query=query,
+                proposed_triplets=proposed_triplets,
+                missing_information=llm_assessment.get("missing_information", []),
+                existing_facts=existing_fact_strings,
+                max_retries=self.max_validation_retries,
+                temperature=temperature,
+                verbose=verbose,
+                intermediate_messages=intermediate_messages,
+            )
+            
+            iteration_validation_attempts = len(validation_history)
+            total_validation_attempts += iteration_validation_attempts
+            all_validation_history.extend(validation_history)
+            
+            # Collect rejected triplets from this iteration
+            iteration_rejected = []
+            for vh in validation_history:
+                iteration_rejected.extend(vh.get("rejected", []))
+            all_rejected_triplets.extend(iteration_rejected)
+            
+            if not success:
+                # All validation attempts failed for this iteration
+                validation_failed = True
+                if verbose:
+                    print(f"\n[Iteration {knowledge_iteration}] Validation failed - proceeding to answer generation")
+                break
+            
+            # ----------------------------------------------------------
+            # Step 5: Persist validated triplets
+            # ----------------------------------------------------------
+            if validated_triplets:
+                triplet_strings = [v.get("triplet", "") for v in validated_triplets]
+                persist_result = self.tool_handler.handle_tool_call(
+                    "validate_and_persist_triplets",
+                    {
+                        "query": query,
+                        "proposed_triplets": triplet_strings,
+                        "existing_facts": existing_fact_strings,
+                        "persist_validated": True,
+                        "skip_validation": True,
+                    }
+                )
+                persist_data = json.loads(persist_result)
+                
+                iteration_persisted_count = persist_data.get("persisted_count", 0)
+                total_persisted_count += iteration_persisted_count
+                
+                tool_calls_log.append({
+                    "iteration": len(tool_calls_log) + 1,
+                    "knowledge_iteration": knowledge_iteration,
+                    "tool": "validate_and_persist_triplets",
+                    "arguments": {"query": query, "persist": True},
+                    "result": persist_data,
+                })
+                
+                # Generate persistence message
+                persist_message = self._generate_persistence_message(validated_triplets)
+                intermediate_messages.append(persist_message)
+                if verbose:
+                    print(persist_message)
+                
+                # Track validated triplets and add to known facts
+                all_validated_triplets.extend(validated_triplets)
+                for vt in validated_triplets:
+                    triplet_str = vt.get("triplet", "")
+                    all_known_fact_strings.add(normalize_triplet_string(triplet_str))
+                
+                # Build notification for final answer
+                if iteration_persisted_count > 0:
+                    new_facts_notification = f"\n---\nNote: This answer includes {total_persisted_count} new fact(s) that were generated and validated:\n"
+                    for vt in all_validated_triplets:
+                        new_facts_notification += f"- {vt.get('triplet', '')} [validated]\n"
+                    new_facts_notification += "\nThese facts have been added to the knowledge base."
+            else:
+                iteration_persisted_count = 0
+            
+            # ----------------------------------------------------------
+            # Generate iteration summary
+            # ----------------------------------------------------------
+            will_continue = knowledge_iteration < self.max_knowledge_iterations
+            iteration_summary = self._generate_iteration_summary_message(
+                iteration=knowledge_iteration,
+                max_iterations=self.max_knowledge_iterations,
+                validated_count=len(validated_triplets),
+                rejected_count=len(iteration_rejected),
+                persisted_count=iteration_persisted_count,
+                assessment=llm_assessment["assessment"],
+                will_continue=will_continue,
+            )
+            intermediate_messages.append(iteration_summary)
+            if verbose:
+                print(iteration_summary)
+            
+            # If no triplets were validated/persisted, we can't make progress
+            if not validated_triplets:
+                if verbose:
+                    print(f"\n[Iteration {knowledge_iteration}] No triplets validated - cannot make progress")
+                break
+        
+        # ============================================================
+        # GENERATE FINAL ANSWER
+        # ============================================================
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"GENERATING FINAL ANSWER (after {knowledge_iterations_completed} iteration(s))")
+            print(f"{'='*60}")
+        
+        # Get the latest facts (re-search to include newly persisted facts)
+        if total_persisted_count > 0:
+            final_search_result = self.tool_handler.handle_tool_call(
+                "search_knowledge_graph",
+                {"query": query, "top_k": 15}  # Slightly more to catch new facts
+            )
+            final_search_data = json.loads(final_search_result)
+            final_fact_strings = [f.get("fact", "") for f in final_search_data.get("facts", [])]
+        else:
+            final_fact_strings = existing_fact_strings
+        
+        system_prompt = self._get_answer_prompt(
+            knowledge_gap_detected,
+            len(all_validated_triplets) > 0
+        )
+        
+        facts_context = "\n".join(f"- {f}" for f in final_fact_strings)
+        
+        user_message = f"""Question: {query}
+
+Available facts from knowledge graph:
+{facts_context}
+
+Please answer the question based on these facts. Be concise and accurate."""
+        
+        history = [{"role": "user", "content": user_message}]
+        
+        answer = openai_chat_completion(
+            system_prompt=system_prompt,
+            history=history,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        
+        # Append new facts notification if we added new knowledge
+        if new_facts_notification:
+            answer = answer + new_facts_notification
+        
+        if verbose:
+            print(f"\nFinal answer: {answer[:200]}...")
+        
+        return ValidatedAgentResult(
+            answer=answer,
+            query=query,
+            tool_calls=tool_calls_log,
+            iterations=len(tool_calls_log),
+            knowledge_gap_detected=knowledge_gap_detected,
+            proposed_triplets=all_proposed_triplets,
+            validated_triplets=all_validated_triplets,
+            rejected_triplets=all_rejected_triplets,
+            persisted_count=total_persisted_count,
+            new_facts_notification=new_facts_notification,
+            intermediate_messages=intermediate_messages,
+            llm_assessment=llm_assessment,
+            validation_failed=validation_failed,
+            validation_attempts=total_validation_attempts,
+            validation_history=all_validation_history,
+            knowledge_iterations=knowledge_iterations_completed,
+        )
+    
+    def _get_answer_prompt(
+        self,
+        gap_detected: bool,
+        new_facts_added: bool,
+    ) -> str:
+        """Generate system prompt for answer generation."""
+        if gap_detected and new_facts_added:
+            return load_prompt("answer_generation_with_new_facts")
+        return load_prompt("answer_generation")
+    
+    def _get_assessment_prompt(self) -> str:
+        """Return the system prompt for knowledge assessment."""
+        return load_prompt("knowledge_assessment")
+    
+    def _assess_knowledge_sufficiency(
+        self,
+        query: str,
+        facts: List[str],
+        temperature: float = 0.1,
+    ) -> Dict[str, Any]:
+        """
+        Ask the local LLM to assess if facts are sufficient.
+        
+        Args:
+            query: The user's question
+            facts: List of fact strings from the knowledge graph
+            temperature: LLM sampling temperature
+            
+        Returns:
+            Dict with: assessment, confidence, answer, missing_information, proposed_triplets
+        """
+        from .edc.edc.utils.llm_utils import openai_chat_completion
+        
+        system_prompt = self._get_assessment_prompt()
+        
+        facts_text = "\n".join(f"- {f}" for f in facts) if facts else "No facts available."
+        
+        user_message = f"""## Question
+{query}
+
+## Available Facts
+{facts_text}
+
+Analyze these facts and respond with the JSON assessment."""
+        
+        history = [{"role": "user", "content": user_message}]
+        
+        response = openai_chat_completion(
+            system_prompt=system_prompt,
+            history=history,
+            temperature=temperature,
+            max_tokens=1024,
+        )
+        
+        return self._parse_assessment_response(response)
+    
+    def _parse_assessment_response(self, response: str) -> Dict[str, Any]:
+        """
+        Parse the structured JSON response from the LLM.
+        
+        Handles:
+        - JSON extraction from markdown code blocks
+        - Fallback parsing if LLM doesn't follow format exactly
+        - Validation of triplet format
+        - Default to "INSUFFICIENT" if parsing fails (conservative approach)
+        
+        Args:
+            response: Raw LLM response string
+            
+        Returns:
+            Parsed assessment dictionary
+        """
+        # Default response for parsing failures
+        default_response = {
+            "assessment": "INSUFFICIENT",
+            "confidence": 0.0,
+            "answer": "Unable to assess facts.",
+            "missing_information": ["Unable to parse LLM response"],
+            "proposed_triplets": [],
+        }
+        
+        try:
+            # Try to extract JSON from markdown code blocks
+            json_patterns = [
+                r'```json\s*(\{[\s\S]*?\})\s*```',
+                r'```\s*(\{[\s\S]*?\})\s*```',
+                r'(\{[\s\S]*"assessment"[\s\S]*\})',
+            ]
+            
+            json_str = None
+            for pattern in json_patterns:
+                match = re.search(pattern, response, re.DOTALL)
+                if match:
+                    json_str = match.group(1)
+                    break
+            
+            if not json_str:
+                # Try to parse the entire response as JSON
+                json_str = response.strip()
+            
+            # Parse JSON
+            data = json.loads(json_str)
+            
+            # Validate and normalize the response
+            assessment = data.get("assessment", "INSUFFICIENT").upper()
+            if assessment not in ["SUFFICIENT", "INSUFFICIENT"]:
+                assessment = "INSUFFICIENT"
+            
+            confidence = float(data.get("confidence", 0.5))
+            confidence = max(0.0, min(1.0, confidence))
+            
+            answer = data.get("answer", "")
+            missing_information = data.get("missing_information", [])
+            
+            # Parse and validate triplets
+            proposed_triplets = []
+            raw_triplets = data.get("proposed_triplets", [])
+            for triplet in raw_triplets:
+                if isinstance(triplet, (list, tuple)) and len(triplet) >= 3:
+                    proposed_triplets.append([str(t) for t in triplet[:3]])
+            
+            return {
+                "assessment": assessment,
+                "confidence": confidence,
+                "answer": answer,
+                "missing_information": missing_information,
+                "proposed_triplets": proposed_triplets,
+            }
+            
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.warning(f"Failed to parse assessment response: {e}")
+            logger.debug(f"Raw response: {response}")
+            return default_response
+    
+    def _generate_gap_detection_message(
+        self,
+        assessment: Dict[str, Any],
+    ) -> str:
+        """
+        Generate message showing knowledge gap and proposed triplets.
+        
+        Args:
+            assessment: The LLM's assessment result
+            
+        Returns:
+            Formatted message string for the user
+        """
+        missing = assessment.get("missing_information", [])
+        proposed = assessment.get("proposed_triplets", [])
+        
+        lines = [
+            "=" * 50,
+            "KNOWLEDGE GAP DETECTED",
+            "=" * 50,
+            "I found some relevant facts, but they are not sufficient to fully answer your question.",
+            "",
+            "What's missing:",
+        ]
+        for item in missing:
+            lines.append(f"  - {item}")
+        
+        lines.extend(["", "Proposed facts to fill these gaps:"])
+        for i, triplet in enumerate(proposed, 1):
+            if isinstance(triplet, (list, tuple)) and len(triplet) >= 3:
+                lines.append(f"  {i}. ({triplet[0]}, {triplet[1]}, {triplet[2]})")
+            else:
+                lines.append(f"  {i}. {triplet}")
+        
+        lines.extend([
+            "",
+            f"Next action: Validating these {len(proposed)} proposed facts with external verification service...",
+            "=" * 50,
+        ])
+        return "\n".join(lines)
+    
+    def _generate_validation_attempt_message(
+        self,
+        attempt: int,
+        max_attempts: int,
+        validated: List[Dict],
+        rejected: List[Dict],
+    ) -> str:
+        """
+        Generate message showing validation attempt results.
+        
+        Args:
+            attempt: Current attempt number
+            max_attempts: Maximum number of attempts
+            validated: List of validated triplet dicts
+            rejected: List of rejected triplet dicts
+            
+        Returns:
+            Formatted message string for the user
+        """
+        total = len(validated) + len(rejected)
+        all_rejected = len(validated) == 0 and len(rejected) > 0
+        
+        lines = [
+            "=" * 50,
+            f"VALIDATION ATTEMPT {attempt}/{max_attempts}" + (" - ALL REJECTED" if all_rejected else ""),
+            "=" * 50,
+            f"Sending {total} proposed triplets to verification service...",
+            "",
+            "Remote LLM Response:",
+        ]
+        
+        if validated:
+            lines.append("  ACCEPTED:")
+            for v in validated:
+                triplet = v.get("triplet", "")
+                reason = v.get("reason", "Validated")
+                status = v.get("status", "validated")
+                status_note = " (corrected)" if status == "corrected" else ""
+                lines.append(f"    - {triplet}{status_note} ✓")
+                lines.append(f"      Reason: {reason}")
+        
+        if rejected:
+            lines.append("  REJECTED:")
+            for r in rejected:
+                triplet = r.get("triplet", "")
+                reason = r.get("reason", "Rejected")
+                lines.append(f"    - {triplet} ✗")
+                lines.append(f"      Reason: {reason}")
+        
+        lines.extend(["", f"Result: {len(validated)} accepted, {len(rejected)} rejected", ""])
+        
+        # Next action
+        if len(validated) > 0:
+            lines.append(f"Next action: Persisting {len(validated)} validated facts to knowledge base...")
+        elif attempt < max_attempts:
+            lines.append("Next action: Analyzing rejection feedback and proposing new facts...")
+        else:
+            lines.append("Next action: All attempts exhausted. Informing user...")
+        
+        lines.append("=" * 50)
+        return "\n".join(lines)
+    
+    def _generate_persistence_message(
+        self,
+        validated_triplets: List[Dict],
+    ) -> str:
+        """
+        Generate message confirming triplet persistence.
+        
+        Args:
+            validated_triplets: List of validated triplet dicts that were persisted
+            
+        Returns:
+            Formatted message string for the user
+        """
+        lines = [
+            "=" * 50,
+            "PERSISTING VALIDATED FACTS",
+            "=" * 50,
+            f"Adding {len(validated_triplets)} validated triplets to knowledge base:",
+        ]
+        for i, v in enumerate(validated_triplets, 1):
+            triplet = v.get("triplet", "")
+            lines.append(f"  {i}. {triplet}")
+        
+        lines.extend([
+            "",
+            "Status: Successfully persisted to Neo4j",
+            "",
+            "Next action: Generating complete answer with new facts...",
+            "=" * 50,
+        ])
+        return "\n".join(lines)
+    
+    def _generate_iteration_summary_message(
+        self,
+        iteration: int,
+        max_iterations: int,
+        validated_count: int,
+        rejected_count: int,
+        persisted_count: int,
+        assessment: str,
+        will_continue: bool,
+    ) -> str:
+        """
+        Generate message summarizing a knowledge iteration cycle.
+        
+        Args:
+            iteration: Current iteration number (1-indexed)
+            max_iterations: Maximum number of iterations
+            validated_count: Number of validated triplets this iteration
+            rejected_count: Number of rejected triplets this iteration
+            persisted_count: Number of persisted triplets this iteration
+            assessment: LLM assessment result (SUFFICIENT/INSUFFICIENT)
+            will_continue: Whether another iteration will be attempted
+            
+        Returns:
+            Formatted message string summarizing the iteration
+        """
+        lines = [
+            "=" * 50,
+            f"KNOWLEDGE ITERATION {iteration}/{max_iterations} COMPLETE",
+            "=" * 50,
+            f"Assessment: {assessment}",
+            f"Validated: {validated_count} triplets",
+            f"Rejected: {rejected_count} triplets",
+            f"Persisted: {persisted_count} triplets",
+            "",
+        ]
+        
+        if will_continue:
+            lines.extend([
+                "Status: Knowledge still insufficient",
+                "Next action: Re-searching knowledge graph with updated facts...",
+            ])
+        else:
+            if assessment == "SUFFICIENT":
+                lines.extend([
+                    "Status: Knowledge is now sufficient",
+                    "Next action: Generating final answer...",
+                ])
+            else:
+                lines.extend([
+                    "Status: Max iterations reached or no progress",
+                    "Next action: Generating best possible answer with available facts...",
+                ])
+        
+        lines.append("=" * 50)
+        return "\n".join(lines)
+    
+    def _generate_retry_message(
+        self,
+        attempt: int,
+        max_attempts: int,
+        new_triplets: List[List[str]],
+    ) -> str:
+        """
+        Generate message showing new proposal after rejection.
+        
+        Args:
+            attempt: Current attempt number (before the retry)
+            max_attempts: Maximum number of attempts
+            new_triplets: List of new proposed triplets
+            
+        Returns:
+            Formatted message string for the user
+        """
+        lines = [
+            "=" * 50,
+            f"RETRY PROPOSAL (Attempt {attempt + 1}/{max_attempts})",
+            "=" * 50,
+            "Based on rejection feedback, proposing new facts:",
+        ]
+        for i, triplet in enumerate(new_triplets, 1):
+            if isinstance(triplet, (list, tuple)) and len(triplet) >= 3:
+                lines.append(f"  {i}. ({triplet[0]}, {triplet[1]}, {triplet[2]})")
+            else:
+                lines.append(f"  {i}. {triplet}")
+        
+        lines.extend([
+            "",
+            "Next action: Sending new proposals for validation...",
+            "=" * 50,
+        ])
+        return "\n".join(lines)
+    
+    def _generate_failure_message(self, query: str, attempts: int) -> str:
+        """
+        Generate user-friendly message when all validation attempts fail.
+        
+        Args:
+            query: The original user query
+            attempts: Number of validation attempts made
+            
+        Returns:
+            Formatted failure message string
+        """
+        lines = [
+            "=" * 50,
+            "VALIDATION FAILED",
+            "=" * 50,
+            f"I apologize, but I was unable to find or generate verified facts",
+            f"to answer your question after {attempts} attempts.",
+            "",
+            "The external verification service could not confirm the accuracy",
+            "of the proposed information.",
+            "",
+            "For reliable information about this topic, I recommend:",
+            "- Consulting authoritative sources directly",
+            "- Rephrasing your question with more specific details",
+            "- Asking about a related topic where verified facts are available",
+            "=" * 50,
+        ]
+        return "\n".join(lines)
+    
+    def _get_rejection_feedback(self, rejected_triplets: List[Dict]) -> str:
+        """
+        Extract rejection reasons from validation result.
+        
+        Args:
+            rejected_triplets: List of rejected triplet dicts with reasons
+            
+        Returns:
+            Formatted feedback string
+        """
+        feedback_parts = []
+        for rejected in rejected_triplets:
+            triplet = rejected.get("triplet", "")
+            reason = rejected.get("reason", "Unknown reason")
+            feedback_parts.append(f"- {triplet}: {reason}")
+        return "\n".join(feedback_parts) if feedback_parts else "No specific feedback available."
+    
+    def _get_reproposal_prompt(self) -> str:
+        """Return the system prompt for re-proposing triplets after rejection."""
+        return load_prompt("triplet_reproposal")
+    
+    def _repropose_triplets(
+        self,
+        query: str,
+        missing_information: List[str],
+        rejection_feedback: str,
+        previous_triplets: List[List[str]],
+        temperature: float = 0.1,
+    ) -> List[List[str]]:
+        """
+        Ask local LLM to propose new triplets based on rejection feedback.
+        
+        Args:
+            query: The original user query
+            missing_information: List of missing information items
+            rejection_feedback: Formatted rejection reasons
+            previous_triplets: List of previously rejected triplets
+            temperature: LLM sampling temperature
+            
+        Returns:
+            List of new proposed triplets
+        """
+        from .edc.edc.utils.llm_utils import openai_chat_completion
+        
+        system_prompt = self._get_reproposal_prompt()
+        
+        # Format previous triplets
+        prev_triplets_text = "\n".join(
+            f"- ({t[0]}, {t[1]}, {t[2]})" if len(t) >= 3 else f"- {t}"
+            for t in previous_triplets
+        )
+        
+        # Format missing information
+        missing_text = "\n".join(f"- {m}" for m in missing_information)
+        
+        user_message = f"""## Rejection Feedback
+{rejection_feedback}
+
+## Original Question
+{query}
+
+## Missing Information (still needed)
+{missing_text}
+
+## Previously Rejected Triplets
+{prev_triplets_text}
+
+Please propose NEW, DIFFERENT triplets that address the missing information while avoiding the issues that caused rejection."""
+        
+        history = [{"role": "user", "content": user_message}]
+        
+        response = openai_chat_completion(
+            system_prompt=system_prompt,
+            history=history,
+            temperature=temperature,
+            max_tokens=1024,
+        )
+        
+        # Parse the response
+        try:
+            # Try to extract JSON
+            json_patterns = [
+                r'```json\s*(\{[\s\S]*?\})\s*```',
+                r'```\s*(\{[\s\S]*?\})\s*```',
+                r'(\{[\s\S]*"proposed_triplets"[\s\S]*\})',
+            ]
+            
+            json_str = None
+            for pattern in json_patterns:
+                match = re.search(pattern, response, re.DOTALL)
+                if match:
+                    json_str = match.group(1)
+                    break
+            
+            if not json_str:
+                json_str = response.strip()
+            
+            data = json.loads(json_str)
+            raw_triplets = data.get("proposed_triplets", [])
+            
+            # Validate and normalize triplets
+            new_triplets = []
+            for triplet in raw_triplets:
+                if isinstance(triplet, (list, tuple)) and len(triplet) >= 3:
+                    new_triplets.append([str(t) for t in triplet[:3]])
+            
+            return new_triplets if new_triplets else previous_triplets
+            
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f"Failed to parse reproposal response: {e}")
+            return previous_triplets
+    
+    def _validate_with_retry(
+        self,
+        query: str,
+        proposed_triplets: List[List[str]],
+        missing_information: List[str],
+        existing_facts: List[str],
+        max_retries: int = 3,
+        temperature: float = 0.1,
+        verbose: bool = False,
+        intermediate_messages: List[str] = None,
+    ) -> Tuple[List[Dict], bool, str, List[Dict]]:
+        """
+        Validate triplets with remote LLM, retrying up to max_retries if all rejected.
+        
+        Args:
+            query: The user's original query
+            proposed_triplets: List of proposed triplets to validate
+            missing_information: List of missing information items
+            existing_facts: List of existing fact strings
+            max_retries: Maximum number of validation attempts
+            temperature: LLM sampling temperature for reproposals
+            verbose: Whether to print progress messages
+            intermediate_messages: List to collect intermediate messages
+            
+        Returns:
+            Tuple of (validated_triplets, success, failure_message, validation_history)
+        """
+        if intermediate_messages is None:
+            intermediate_messages = []
+        
+        current_triplets = proposed_triplets
+        validation_history = []
+        
+        for attempt in range(1, max_retries + 1):
+            # Format triplets as strings for validation
+            triplet_strings = [
+                f"({t[0]}, {t[1]}, {t[2]})" if len(t) >= 3 else str(t)
+                for t in current_triplets
+            ]
+            
+            # Call remote LLM for validation via tool handler
+            validate_result = self.tool_handler.handle_tool_call(
+                "validate_and_persist_triplets",
+                {
+                    "query": query,
+                    "proposed_triplets": triplet_strings,
+                    "existing_facts": existing_facts,
+                    "persist_validated": False,  # Don't persist yet - we may retry
+                }
+            )
+            validate_data = json.loads(validate_result)
+            
+            validated = validate_data.get("validated_triplets", [])
+            rejected = validate_data.get("rejected_triplets", [])
+            all_rejected = len(validated) == 0 and len(rejected) > 0
+            
+            # Generate validation attempt message
+            attempt_message = self._generate_validation_attempt_message(
+                attempt=attempt,
+                max_attempts=max_retries,
+                validated=validated,
+                rejected=rejected,
+            )
+            intermediate_messages.append(attempt_message)
+            if verbose:
+                print(attempt_message)
+            
+            # Record in history
+            validation_history.append({
+                "attempt": attempt,
+                "proposed": current_triplets,
+                "validated": validated,
+                "rejected": rejected,
+                "all_rejected": all_rejected,
+            })
+            
+            # Check if any triplets were accepted
+            if validated:
+                return validated, True, "", validation_history
+            
+            # All rejected - get feedback for retry
+            if attempt < max_retries:
+                rejection_feedback = self._get_rejection_feedback(rejected)
+                
+                # Ask local LLM to re-propose with feedback
+                current_triplets = self._repropose_triplets(
+                    query=query,
+                    missing_information=missing_information,
+                    rejection_feedback=rejection_feedback,
+                    previous_triplets=current_triplets,
+                    temperature=temperature,
+                )
+                
+                # Generate retry proposal message
+                retry_message = self._generate_retry_message(
+                    attempt=attempt,
+                    max_attempts=max_retries,
+                    new_triplets=current_triplets,
+                )
+                intermediate_messages.append(retry_message)
+                if verbose:
+                    print(retry_message)
+        
+        # All retries exhausted
+        failure_message = self._generate_failure_message(query, max_retries)
+        intermediate_messages.append(failure_message)
+        if verbose:
+            print(failure_message)
+        
+        return [], False, failure_message, validation_history
+
+
+def create_mcp_agent_with_validation(
+    neo4j_uri: str = "bolt://localhost:7687",
+    neo4j_user: str = "neo4j",
+    neo4j_password: str = None,
+    neo4j_database: str = "neo4j",
+    embedding_model: str = None,
+    max_iterations: int = 5,
+    allow_cypher: bool = False,
+    enable_validation: bool = True,
+    auto_expand: bool = True,
+    max_validation_retries: int = 3,
+    max_knowledge_iterations: int = 3,
+) -> MCPAgentWithValidation:
+    """
+    Convenience function to create an MCPAgentWithValidation.
+    
+    This creates an agent that:
+    1. Queries the knowledge graph
+    2. Uses LLM to assess if facts are sufficient (with complete triplet proposals)
+    3. Validates proposed triplets with remote LLM (with retry mechanism)
+    4. Persists validated facts
+    5. Re-queries and re-assesses iteratively until sufficient or max iterations
+    6. Provides detailed intermediate messages throughout the process
+    
+    Required environment variables:
+    - For local LLM: source export_local_llm.sh (or USE_LOCAL_LLM=true)
+    - For remote validation: source export_google_ai.sh (or REMOTE_LLM_* vars)
+    
+    Args:
+        neo4j_uri: Neo4j Bolt URI
+        neo4j_user: Neo4j username
+        neo4j_password: Neo4j password
+        neo4j_database: Neo4j database name
+        embedding_model: Embedding model name
+        max_iterations: Maximum tool call iterations
+        allow_cypher: Whether to allow raw Cypher queries
+        enable_validation: Whether to enable remote validation
+        auto_expand: Whether to auto-expand when gaps detected
+        max_validation_retries: Maximum retries for validation (default: 3)
+        max_knowledge_iterations: Maximum search-assess-expand cycles (default: 3)
+        
+    Returns:
+        Configured MCPAgentWithValidation instance
+    """
+    from .neo4j_store import Neo4jStore
+    from .embedder import get_embedder
+    
+    # Get configuration from environment or use defaults
+    if neo4j_password is None:
+        neo4j_password = os.environ.get("NEO4J_PASSWORD", "password123")
+    
+    if embedding_model is None:
+        embedding_model = os.environ.get(
+            "LOCAL_EMBEDDER_MODEL",
+            "BAAI/bge-small-en-v1.5"
+        )
+    
+    local_model_name = os.environ.get("LOCAL_LLM_MODEL", "local_llm")
+    
+    logger.info(f"Creating MCPAgentWithValidation:")
+    logger.info(f"  Neo4j: {neo4j_uri}")
+    logger.info(f"  Embedding model: {embedding_model}")
+    logger.info(f"  Validation: {enable_validation}")
+    logger.info(f"  Auto-expand: {auto_expand}")
+    logger.info(f"  Max validation retries: {max_validation_retries}")
+    logger.info(f"  Max knowledge iterations: {max_knowledge_iterations}")
+    
+    # Create Neo4j store
+    neo4j_store = Neo4jStore(
+        uri=neo4j_uri,
+        user=neo4j_user,
+        password=neo4j_password,
+        database=neo4j_database,
+    )
+    
+    # Create embedder
+    embedder = get_embedder(model_name=embedding_model)
+    
+    # Create agent
+    agent = MCPAgentWithValidation(
+        neo4j_store=neo4j_store,
+        embedder=embedder,
+        max_iterations=max_iterations,
+        allow_cypher=allow_cypher,
+        enable_validation=enable_validation,
+        auto_expand=auto_expand,
+        max_validation_retries=max_validation_retries,
+        max_knowledge_iterations=max_knowledge_iterations,
+        local_model_name=local_model_name,
+    )
+    
+    return agent
 
 
 if __name__ == "__main__":

@@ -10,14 +10,17 @@ from typing import Optional
 from pathlib import Path
 
 from .retriever import RetrievalResult
+from .prompts import load_prompt_safe
 
 logger = logging.getLogger(__name__)
 
 # Default template path
 DEFAULT_TEMPLATE_PATH = Path(__file__).parent / "edc" / "prompt_templates" / "kg_qa.txt"
 
-# Fallback template if file not found
-FALLBACK_TEMPLATE = """You are a knowledge graph question answering assistant.
+# Fallback template - load from prompts directory with inline backup
+FALLBACK_TEMPLATE = load_prompt_safe(
+    "kg_qa_fallback",
+    fallback="""You are a knowledge graph question answering assistant.
 
 === KNOWLEDGE GRAPH FACTS ===
 {facts}
@@ -29,6 +32,7 @@ Answer using only the facts above. If the answer is not in the facts, say "I can
 
 === ANSWER ===
 """
+)
 
 
 class KGPromptBuilder:
@@ -72,9 +76,9 @@ class KGPromptBuilder:
     
     def _default_system_prompt(self) -> str:
         """Default system prompt for chat models."""
-        return (
-            "You are a helpful assistant that answers questions based on knowledge graph facts. "
-            "Only use the provided facts to answer. Be concise and accurate."
+        return load_prompt_safe(
+            "kg_qa_system",
+            fallback="You are a helpful assistant that answers questions based on knowledge graph facts. Only use the provided facts to answer. Be concise and accurate."
         )
     
     def build(
