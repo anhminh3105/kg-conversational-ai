@@ -643,6 +643,11 @@ class ValidatedAgentResult(AgentResult):
     validation_history: List[Dict[str, Any]] = field(default_factory=list)
     # Iterative knowledge expansion tracking
     knowledge_iterations: int = 1  # Number of search-assess-expand cycles completed
+    # Remote model tracking
+    remote_model_name: str = ""  # Which frontier model validated the triplets
+    # Persistence justification
+    persistence_justification: Dict[str, Any] = field(default_factory=dict)
+    skipped_triplets: List[Dict[str, Any]] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -660,6 +665,9 @@ class ValidatedAgentResult(AgentResult):
             "validation_attempts": self.validation_attempts,
             "validation_history": self.validation_history,
             "knowledge_iterations": self.knowledge_iterations,
+            "remote_model_name": self.remote_model_name,
+            "persistence_justification": self.persistence_justification,
+            "skipped_triplets": self.skipped_triplets,
         })
         return result
 
@@ -673,15 +681,21 @@ class MCPAgentWithValidation:
     2. Detect if there's a knowledge gap (insufficient facts)
     3. If gap detected, use local LLM to propose new triplets
     4. Send proposed triplets to remote LLM for validation
-    5. Persist validated/corrected triplets to Neo4j
-    6. Generate final answer with notification about new facts
+    5. Generate final answer using existing + validated facts
+    6. Local LLM justifies which validated triplets to persist
+    7. Persist only justified triplets to Neo4j
+    
+    Persistence is deferred until after the answer is generated, and the
+    local LLM acts as a quality gate to prevent useless/vague triplets
+    from polluting the knowledge graph.
     
     Usage:
         agent = MCPAgentWithValidation(neo4j_store, embedder)
         result = agent.run("What awards did Einstein win?")
         
         print(result.answer)
-        print(result.new_facts_notification)  # Shows newly added facts
+        print(result.persisted_count)        # How many triplets were persisted
+        print(result.skipped_triplets)       # Triplets the LLM decided not to persist
     """
     
     def __init__(
@@ -755,9 +769,11 @@ class MCPAgentWithValidation:
         1. Search the knowledge graph for relevant facts
         2. Use local LLM to assess if facts are sufficient
         3. If insufficient, propose triplets and validate with remote LLM
-        4. Persist validated triplets and re-search
+        4. Collect validated triplets in memory (no persistence yet)
         5. Repeat until sufficient knowledge or max iterations reached
-        6. Generate final answer with all accumulated facts
+        6. Generate final answer using existing + validated facts
+        7. Local LLM justifies which validated triplets to persist
+        8. Persist only the justified triplets to Neo4j
         
         Args:
             query: User question
@@ -781,11 +797,11 @@ class MCPAgentWithValidation:
         all_validated_triplets = []
         all_rejected_triplets = []
         total_persisted_count = 0
-        new_facts_notification = ""
         llm_assessment = {}
         validation_failed = False
         total_validation_attempts = 0
         knowledge_iterations_completed = 0
+        remote_model_name = ""
         
         # Track all known facts (from search + validated) to avoid re-proposing
         all_known_fact_strings = set()
@@ -921,7 +937,7 @@ class MCPAgentWithValidation:
                     print(f"\n[Iteration {knowledge_iteration}] Validation disabled - proceeding to answer generation")
                 break
             
-            validated_triplets, success, failure_msg, validation_history = self._validate_with_retry(
+            validated_triplets, success, failure_msg, validation_history, iter_remote_model = self._validate_with_retry(
                 query=query,
                 proposed_triplets=proposed_triplets,
                 missing_information=llm_assessment.get("missing_information", []),
@@ -930,7 +946,12 @@ class MCPAgentWithValidation:
                 temperature=temperature,
                 verbose=verbose,
                 intermediate_messages=intermediate_messages,
+                knowledge_iteration=knowledge_iteration,
             )
+            
+            # Track the remote model name from validation
+            if iter_remote_model and iter_remote_model != "unknown":
+                remote_model_name = iter_remote_model
             
             iteration_validation_attempts = len(validation_history)
             total_validation_attempts += iteration_validation_attempts
@@ -950,53 +971,16 @@ class MCPAgentWithValidation:
                 break
             
             # ----------------------------------------------------------
-            # Step 5: Persist validated triplets
+            # Step 5: Collect validated triplets (defer persistence)
             # ----------------------------------------------------------
             if validated_triplets:
-                triplet_strings = [v.get("triplet", "") for v in validated_triplets]
-                persist_result = self.tool_handler.handle_tool_call(
-                    "validate_and_persist_triplets",
-                    {
-                        "query": query,
-                        "proposed_triplets": triplet_strings,
-                        "existing_facts": existing_fact_strings,
-                        "persist_validated": True,
-                        "skip_validation": True,
-                    }
-                )
-                persist_data = json.loads(persist_result)
-                
-                iteration_persisted_count = persist_data.get("persisted_count", 0)
-                total_persisted_count += iteration_persisted_count
-                
-                tool_calls_log.append({
-                    "iteration": len(tool_calls_log) + 1,
-                    "knowledge_iteration": knowledge_iteration,
-                    "tool": "validate_and_persist_triplets",
-                    "arguments": {"query": query, "persist": True},
-                    "result": persist_data,
-                })
-                
-                # Generate persistence message
-                persist_message = self._generate_persistence_message(validated_triplets)
-                intermediate_messages.append(persist_message)
-                if verbose:
-                    print(persist_message)
-                
                 # Track validated triplets and add to known facts
                 all_validated_triplets.extend(validated_triplets)
                 for vt in validated_triplets:
                     triplet_str = vt.get("triplet", "")
                     all_known_fact_strings.add(normalize_triplet_string(triplet_str))
-                
-                # Build notification for final answer
-                if iteration_persisted_count > 0:
-                    new_facts_notification = f"\n---\nNote: This answer includes {total_persisted_count} new fact(s) that were generated and validated:\n"
-                    for vt in all_validated_triplets:
-                        new_facts_notification += f"- {vt.get('triplet', '')} [validated]\n"
-                    new_facts_notification += "\nThese facts have been added to the knowledge base."
-            else:
-                iteration_persisted_count = 0
+                    # Add to existing_fact_strings so next iteration sees them
+                    existing_fact_strings.append(triplet_str)
             
             # ----------------------------------------------------------
             # Generate iteration summary
@@ -1007,7 +991,7 @@ class MCPAgentWithValidation:
                 max_iterations=self.max_knowledge_iterations,
                 validated_count=len(validated_triplets),
                 rejected_count=len(iteration_rejected),
-                persisted_count=iteration_persisted_count,
+                persisted_count=0,  # Deferred until after answer
                 assessment=llm_assessment["assessment"],
                 will_continue=will_continue,
             )
@@ -1015,7 +999,7 @@ class MCPAgentWithValidation:
             if verbose:
                 print(iteration_summary)
             
-            # If no triplets were validated/persisted, we can't make progress
+            # If no triplets were validated, we can't make progress
             if not validated_triplets:
                 if verbose:
                     print(f"\n[Iteration {knowledge_iteration}] No triplets validated - cannot make progress")
@@ -1029,25 +1013,38 @@ class MCPAgentWithValidation:
             print(f"GENERATING FINAL ANSWER (after {knowledge_iterations_completed} iteration(s))")
             print(f"{'='*60}")
         
-        # Get the latest facts (re-search to include newly persisted facts)
-        if total_persisted_count > 0:
-            final_search_result = self.tool_handler.handle_tool_call(
-                "search_knowledge_graph",
-                {"query": query, "top_k": 15}  # Slightly more to catch new facts
-            )
-            final_search_data = json.loads(final_search_result)
-            final_fact_strings = [f.get("fact", "") for f in final_search_data.get("facts", [])]
-        else:
-            final_fact_strings = existing_fact_strings
+        # Build final facts: existing KG facts + validated (not-yet-persisted) triplets
+        final_fact_strings = list(existing_fact_strings)
+        validated_fact_strings = []
+        for vt in all_validated_triplets:
+            triplet_str = vt.get("triplet", "")
+            if triplet_str and triplet_str not in final_fact_strings:
+                final_fact_strings.append(triplet_str)
+                validated_fact_strings.append(triplet_str)
         
         system_prompt = self._get_answer_prompt(
             knowledge_gap_detected,
-            len(all_validated_triplets) > 0
+            len(all_validated_triplets) > 0,
+            remote_model_name=remote_model_name,
+            num_validated=len(all_validated_triplets),
         )
         
         facts_context = "\n".join(f"- {f}" for f in final_fact_strings)
         
-        user_message = f"""Question: {query}
+        # Build context about validated triplets for the answer prompt
+        if validated_fact_strings:
+            validated_context = "\n".join(f"- {f} [validated by {remote_model_name}]" for f in validated_fact_strings)
+            user_message = f"""Question: {query}
+
+Available facts from knowledge graph:
+{facts_context}
+
+Additionally, the following {len(validated_fact_strings)} fact(s) were proposed to fill knowledge gaps and validated by {remote_model_name}:
+{validated_context}
+
+The knowledge graph did not have sufficient information to answer this question directly. Please answer the question using both the existing facts and the validated facts above. Be concise and accurate. Clearly state that the knowledge graph was insufficient and that you are supplementing with {len(validated_fact_strings)} validated fact(s)."""
+        else:
+            user_message = f"""Question: {query}
 
 Available facts from knowledge graph:
 {facts_context}
@@ -1063,12 +1060,65 @@ Please answer the question based on these facts. Be concise and accurate."""
             max_tokens=max_tokens,
         )
         
-        # Append new facts notification if we added new knowledge
-        if new_facts_notification:
-            answer = answer + new_facts_notification
-        
         if verbose:
             print(f"\nFinal answer: {answer[:200]}...")
+        
+        # ============================================================
+        # PERSISTENCE JUSTIFICATION & EXECUTION (after answer)
+        # ============================================================
+        persistence_justification = {}
+        skipped_triplets = []
+        
+        if all_validated_triplets:
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"PERSISTENCE JUSTIFICATION")
+                print(f"{'='*60}")
+            
+            # Ask local LLM whether each validated triplet should be persisted
+            persistence_justification = self._justify_persistence(
+                query=query,
+                answer=answer,
+                validated_triplets=all_validated_triplets,
+                temperature=temperature,
+            )
+            
+            triplets_to_persist = persistence_justification.get("persist", [])
+            skipped_triplets = persistence_justification.get("skip", [])
+            
+            if verbose:
+                print(f"  Persist: {len(triplets_to_persist)} triplets")
+                for tp in triplets_to_persist:
+                    print(f"    + {tp.get('triplet', '')} - {tp.get('reason', '')}")
+                print(f"  Skip: {len(skipped_triplets)} triplets")
+                for sk in skipped_triplets:
+                    print(f"    - {sk.get('triplet', '')} - {sk.get('reason', '')}")
+            
+            # Persist only the justified triplets
+            if triplets_to_persist:
+                triplet_strings = [t["triplet"] for t in triplets_to_persist]
+                persist_result = self.tool_handler.handle_tool_call(
+                    "validate_and_persist_triplets",
+                    {
+                        "query": query,
+                        "proposed_triplets": triplet_strings,
+                        "existing_facts": existing_fact_strings,
+                        "persist_validated": True,
+                        "skip_validation": True,
+                    }
+                )
+                persist_data = json.loads(persist_result)
+                total_persisted_count = persist_data.get("persisted_count", 0)
+                
+                tool_calls_log.append({
+                    "iteration": len(tool_calls_log) + 1,
+                    "tool": "validate_and_persist_triplets",
+                    "arguments": {"query": query, "persist": True},
+                    "result": persist_data,
+                })
+                
+                if verbose:
+                    print(f"\n  Persisted {total_persisted_count} triplets to Neo4j")
         
         return ValidatedAgentResult(
             answer=answer,
@@ -1080,23 +1130,32 @@ Please answer the question based on these facts. Be concise and accurate."""
             validated_triplets=all_validated_triplets,
             rejected_triplets=all_rejected_triplets,
             persisted_count=total_persisted_count,
-            new_facts_notification=new_facts_notification,
+            new_facts_notification="",
             intermediate_messages=intermediate_messages,
             llm_assessment=llm_assessment,
             validation_failed=validation_failed,
             validation_attempts=total_validation_attempts,
             validation_history=all_validation_history,
             knowledge_iterations=knowledge_iterations_completed,
+            remote_model_name=remote_model_name,
+            persistence_justification=persistence_justification,
+            skipped_triplets=skipped_triplets,
         )
     
     def _get_answer_prompt(
         self,
         gap_detected: bool,
         new_facts_added: bool,
+        remote_model_name: str = "",
+        num_validated: int = 0,
     ) -> str:
         """Generate system prompt for answer generation."""
         if gap_detected and new_facts_added:
-            return load_prompt("answer_generation_with_new_facts")
+            return load_prompt(
+                "answer_generation_with_new_facts",
+                remote_model_name=remote_model_name or "remote LLM",
+                num_validated=num_validated,
+            )
         return load_prompt("answer_generation")
     
     def _get_assessment_prompt(self) -> str:
@@ -1243,14 +1302,15 @@ Analyze these facts and respond with the JSON assessment."""
             "=" * 50,
             "KNOWLEDGE GAP DETECTED",
             "=" * 50,
-            "I found some relevant facts, but they are not sufficient to fully answer your question.",
+            "The knowledge graph does not contain sufficient information to answer your question.",
+            f"I will propose {len(proposed)} fact(s) from my own understanding for external validation.",
             "",
             "What's missing:",
         ]
         for item in missing:
             lines.append(f"  - {item}")
         
-        lines.extend(["", "Proposed facts to fill these gaps:"])
+        lines.extend(["", f"Proposed facts ({len(proposed)}) to fill these gaps:"])
         for i, triplet in enumerate(proposed, 1):
             if isinstance(triplet, (list, tuple)) and len(triplet) >= 3:
                 lines.append(f"  {i}. ({triplet[0]}, {triplet[1]}, {triplet[2]})")
@@ -1259,7 +1319,7 @@ Analyze these facts and respond with the JSON assessment."""
         
         lines.extend([
             "",
-            f"Next action: Validating these {len(proposed)} proposed facts with external verification service...",
+            f"Next action: Sending {len(proposed)} proposed facts to remote LLM for validation...",
             "=" * 50,
         ])
         return "\n".join(lines)
@@ -1270,6 +1330,7 @@ Analyze these facts and respond with the JSON assessment."""
         max_attempts: int,
         validated: List[Dict],
         rejected: List[Dict],
+        remote_model: str = "unknown",
     ) -> str:
         """
         Generate message showing validation attempt results.
@@ -1279,6 +1340,7 @@ Analyze these facts and respond with the JSON assessment."""
             max_attempts: Maximum number of attempts
             validated: List of validated triplet dicts
             rejected: List of rejected triplet dicts
+            remote_model: Name of the remote model used for validation
             
         Returns:
             Formatted message string for the user
@@ -1286,13 +1348,17 @@ Analyze these facts and respond with the JSON assessment."""
         total = len(validated) + len(rejected)
         all_rejected = len(validated) == 0 and len(rejected) > 0
         
+        header = f"VALIDATION ATTEMPT {attempt}/{max_attempts} (by {remote_model})"
+        if all_rejected:
+            header += " - ALL REJECTED"
+        
         lines = [
             "=" * 50,
-            f"VALIDATION ATTEMPT {attempt}/{max_attempts}" + (" - ALL REJECTED" if all_rejected else ""),
+            header,
             "=" * 50,
-            f"Sending {total} proposed triplets to verification service...",
+            f"Sending {total} proposed triplets to {remote_model} for validation...",
             "",
-            "Remote LLM Response:",
+            f"Response from {remote_model}:",
         ]
         
         if validated:
@@ -1317,7 +1383,7 @@ Analyze these facts and respond with the JSON assessment."""
         
         # Next action
         if len(validated) > 0:
-            lines.append(f"Next action: Persisting {len(validated)} validated facts to knowledge base...")
+            lines.append(f"Next action: Using {len(validated)} validated facts to generate answer (persistence deferred until after answer)...")
         elif attempt < max_attempts:
             lines.append("Next action: Analyzing rejection feedback and proposing new facts...")
         else:
@@ -1376,7 +1442,7 @@ Analyze these facts and respond with the JSON assessment."""
             max_iterations: Maximum number of iterations
             validated_count: Number of validated triplets this iteration
             rejected_count: Number of rejected triplets this iteration
-            persisted_count: Number of persisted triplets this iteration
+            persisted_count: Number of persisted triplets this iteration (0 when deferred)
             assessment: LLM assessment result (SUFFICIENT/INSUFFICIENT)
             will_continue: Whether another iteration will be attempted
             
@@ -1390,14 +1456,14 @@ Analyze these facts and respond with the JSON assessment."""
             f"Assessment: {assessment}",
             f"Validated: {validated_count} triplets",
             f"Rejected: {rejected_count} triplets",
-            f"Persisted: {persisted_count} triplets",
+            f"Persistence: deferred until after answer",
             "",
         ]
         
         if will_continue:
             lines.extend([
                 "Status: Knowledge still insufficient",
-                "Next action: Re-searching knowledge graph with updated facts...",
+                "Next action: Re-assessing with validated facts included...",
             ])
         else:
             if assessment == "SUFFICIENT":
@@ -1591,6 +1657,113 @@ Please propose NEW, DIFFERENT triplets that address the missing information whil
             logger.warning(f"Failed to parse reproposal response: {e}")
             return previous_triplets
     
+    def _justify_persistence(
+        self,
+        query: str,
+        answer: str,
+        validated_triplets: List[Dict[str, Any]],
+        temperature: float = 0.1,
+    ) -> Dict[str, Any]:
+        """
+        Ask the local LLM to evaluate whether each validated triplet should be persisted.
+        
+        The LLM decides per-triplet whether it contains specific, useful knowledge
+        worth adding to the KG, or whether it is too vague/generic to be worth persisting.
+        
+        Args:
+            query: The user's original question
+            answer: The answer that was generated
+            validated_triplets: List of validated triplet dicts from remote LLM
+            temperature: LLM sampling temperature
+            
+        Returns:
+            Dict with "persist" and "skip" lists, each containing
+            {"triplet": str, "reason": str} entries.
+        """
+        from .edc.edc.utils.llm_utils import openai_chat_completion
+        
+        system_prompt = load_prompt("persistence_justification")
+        
+        triplets_text = "\n".join(
+            f"- {vt.get('triplet', '')}" for vt in validated_triplets
+        )
+        
+        user_message = f"""## Question
+{query}
+
+## Answer Produced
+{answer}
+
+## Validated Triplets to Evaluate
+{triplets_text}
+
+Decide which triplets should be persisted to the knowledge graph. Respond with JSON."""
+        
+        history = [{"role": "user", "content": user_message}]
+        
+        response = openai_chat_completion(
+            system_prompt=system_prompt,
+            history=history,
+            temperature=temperature,
+            max_tokens=1024,
+        )
+        
+        # Parse the response
+        default_result = {
+            "persist": [{"triplet": vt.get("triplet", ""), "reason": "Fallback: persisting all (parse failure)"} for vt in validated_triplets],
+            "skip": [],
+        }
+        
+        try:
+            json_patterns = [
+                r'```json\s*(\{[\s\S]*?\})\s*```',
+                r'```\s*(\{[\s\S]*?\})\s*```',
+                r'(\{[\s\S]*"persist"[\s\S]*\})',
+            ]
+            
+            json_str = None
+            for pattern in json_patterns:
+                match = re.search(pattern, response, re.DOTALL)
+                if match:
+                    json_str = match.group(1)
+                    break
+            
+            if not json_str:
+                json_str = response.strip()
+            
+            data = json.loads(json_str)
+            
+            persist = data.get("persist", [])
+            skip = data.get("skip", [])
+            
+            # Validate structure
+            valid_persist = []
+            for item in persist:
+                if isinstance(item, dict) and "triplet" in item:
+                    valid_persist.append({
+                        "triplet": item["triplet"],
+                        "reason": item.get("reason", "Accepted for persistence"),
+                    })
+            
+            valid_skip = []
+            for item in skip:
+                if isinstance(item, dict) and "triplet" in item:
+                    valid_skip.append({
+                        "triplet": item["triplet"],
+                        "reason": item.get("reason", "Skipped"),
+                    })
+            
+            # If the LLM returned empty persist and skip, fall back to persisting all
+            if not valid_persist and not valid_skip:
+                return default_result
+            
+            return {"persist": valid_persist, "skip": valid_skip}
+            
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.warning(f"Failed to parse persistence justification response: {e}")
+            logger.debug(f"Raw response: {response}")
+            return default_result
+    
     def _validate_with_retry(
         self,
         query: str,
@@ -1601,7 +1774,8 @@ Please propose NEW, DIFFERENT triplets that address the missing information whil
         temperature: float = 0.1,
         verbose: bool = False,
         intermediate_messages: List[str] = None,
-    ) -> Tuple[List[Dict], bool, str, List[Dict]]:
+        knowledge_iteration: int = 1,
+    ) -> Tuple[List[Dict], bool, str, List[Dict], str]:
         """
         Validate triplets with remote LLM, retrying up to max_retries if all rejected.
         
@@ -1614,15 +1788,17 @@ Please propose NEW, DIFFERENT triplets that address the missing information whil
             temperature: LLM sampling temperature for reproposals
             verbose: Whether to print progress messages
             intermediate_messages: List to collect intermediate messages
+            knowledge_iteration: Which knowledge iteration this validation belongs to
             
         Returns:
-            Tuple of (validated_triplets, success, failure_message, validation_history)
+            Tuple of (validated_triplets, success, failure_message, validation_history, remote_model_name)
         """
         if intermediate_messages is None:
             intermediate_messages = []
         
         current_triplets = proposed_triplets
         validation_history = []
+        remote_model_name = "unknown"
         
         for attempt in range(1, max_retries + 1):
             # Format triplets as strings for validation
@@ -1646,6 +1822,7 @@ Please propose NEW, DIFFERENT triplets that address the missing information whil
             validated = validate_data.get("validated_triplets", [])
             rejected = validate_data.get("rejected_triplets", [])
             all_rejected = len(validated) == 0 and len(rejected) > 0
+            remote_model_name = validate_data.get("remote_model", "unknown")
             
             # Generate validation attempt message
             attempt_message = self._generate_validation_attempt_message(
@@ -1653,6 +1830,7 @@ Please propose NEW, DIFFERENT triplets that address the missing information whil
                 max_attempts=max_retries,
                 validated=validated,
                 rejected=rejected,
+                remote_model=remote_model_name,
             )
             intermediate_messages.append(attempt_message)
             if verbose:
@@ -1660,16 +1838,18 @@ Please propose NEW, DIFFERENT triplets that address the missing information whil
             
             # Record in history
             validation_history.append({
+                "knowledge_iteration": knowledge_iteration,
                 "attempt": attempt,
                 "proposed": current_triplets,
                 "validated": validated,
                 "rejected": rejected,
                 "all_rejected": all_rejected,
+                "remote_model": remote_model_name,
             })
             
             # Check if any triplets were accepted
             if validated:
-                return validated, True, "", validation_history
+                return validated, True, "", validation_history, remote_model_name
             
             # All rejected - get feedback for retry
             if attempt < max_retries:
@@ -1700,7 +1880,7 @@ Please propose NEW, DIFFERENT triplets that address the missing information whil
         if verbose:
             print(failure_message)
         
-        return [], False, failure_message, validation_history
+        return [], False, failure_message, validation_history, remote_model_name
 
 
 def create_mcp_agent_with_validation(

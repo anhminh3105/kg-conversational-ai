@@ -19,7 +19,7 @@ Usage:
     # Source the local LLM config first
     source export_local_llm.sh
     
-    # Run full MCP agent demo
+    # Run full MCP agent demo (predefined queries)
     python scripts/demo_mcp_agent.py
     
     # Run with custom Neo4j connection
@@ -46,6 +46,8 @@ Usage:
     
     # Run validated expansion with verbose output
     python scripts/demo_mcp_agent.py --validated-expand --verbose
+
+For interactive chat sessions, use: python scripts/interactive_agent.py
 """
 
 import argparse
@@ -367,16 +369,16 @@ def run_validated_expansion_demo(
     query: str = None,
 ):
     """
-    Demonstrate the dual-LLM validated expansion workflow with detailed intermediate messages.
+    Demonstrate the dual-LLM validated expansion workflow with deferred persistence.
     
     This demo shows the complete workflow:
     1. Query the knowledge graph for relevant facts
     2. LLM assesses if facts are sufficient (with complete triplet proposals)
-    3. If insufficient, shows detailed gap detection message with proposed triplets
-    4. Validates with remote LLM (with retry mechanism up to 3 attempts)
-    5. Shows validation attempt results for each attempt
-    6. Persists validated triplets and shows confirmation
-    7. Handles graceful failure if all attempts fail
+    3. If insufficient, communicates the gap and proposes triplets
+    4. Validates with remote LLM (shows which model, with retry up to 3 attempts)
+    5. Generates final answer using existing + validated facts
+    6. Local LLM justifies which validated triplets should be persisted
+    7. Persists only justified triplets to Neo4j
     
     Prerequisites:
         - Configure dual-LLM mode: source export_dual_llm.sh
@@ -385,7 +387,7 @@ def run_validated_expansion_demo(
     import json
     
     print("\n" + "=" * 60)
-    print("Dual-LLM Validated Expansion Demo (with LLM-based Assessment)")
+    print("Dual-LLM Validated Expansion Demo (Deferred Persistence)")
     print("=" * 60)
     
     # Check if remote LLM is configured
@@ -471,12 +473,14 @@ def run_validated_expansion_demo(
                     partial = assessment['answer'][:100] + "..." if len(assessment.get('answer', '')) > 100 else assessment['answer']
                     print(f"  Partial answer: {partial}")
             
-            # Display validation statistics
+            # Display validation statistics with remote model name
+            result_remote_model = getattr(result, 'remote_model_name', '') or remote_model
             print(f"\n--- Validation Summary ---")
-            print(f"  Knowledge iterations: {result.knowledge_iterations}")
-            print(f"  Knowledge gap detected: {result.knowledge_gap_detected}")
-            print(f"  Validation attempts: {result.validation_attempts}")
-            print(f"  Validation failed: {result.validation_failed}")
+            print(f"  Remote model used:     {result_remote_model}")
+            print(f"  Knowledge iterations:  {result.knowledge_iterations}")
+            print(f"  Knowledge gap detected:{result.knowledge_gap_detected}")
+            print(f"  Validation attempts:   {result.validation_attempts}")
+            print(f"  Validation failed:     {result.validation_failed}")
             
             if result.proposed_triplets:
                 print(f"\n--- Proposed Triplets (Local LLM) ---")
@@ -485,7 +489,7 @@ def run_validated_expansion_demo(
                     print(f"    + {t}")
             
             if result.validated_triplets:
-                print(f"\n--- Validated Triplets (Remote LLM) ---")
+                print(f"\n--- Validated Triplets ({result_remote_model}) ---")
                 print(f"  Count: {len(result.validated_triplets)}")
                 for vt in result.validated_triplets:
                     status = vt.get('status', 'unknown')
@@ -513,15 +517,43 @@ def run_validated_expansion_demo(
                     all_rejected = vh.get('all_rejected', False)
                     validated = vh.get('validated', [])
                     rejected = vh.get('rejected', [])
+                    vh_model = vh.get('remote_model', result_remote_model)
+                    ki = vh.get('knowledge_iteration', '')
+                    ki_label = f"Iter {ki}, " if ki else ""
                     status = "ALL REJECTED" if all_rejected else f"{len(validated)} accepted"
-                    print(f"  Attempt {attempt}: {status}, {len(rejected)} rejected")
+                    print(f"  {ki_label}Attempt {attempt} ({vh_model}): {status}, {len(rejected)} rejected")
             
-            if result.persisted_count > 0:
-                print(f"\n--- Persistence ---")
-                print(f"  Persisted {result.persisted_count} new triplets to Neo4j")
-            
+            # Display the answer BEFORE persistence details
             print(f"\n--- Final Answer ---")
             print(result.answer)
+            
+            # Display persistence justification (after answer)
+            persistence_justification = getattr(result, 'persistence_justification', {})
+            skipped_triplets = getattr(result, 'skipped_triplets', [])
+            
+            if persistence_justification:
+                persist_list = persistence_justification.get("persist", [])
+                skip_list = persistence_justification.get("skip", [])
+                
+                print(f"\n--- Persistence Justification (Local LLM) ---")
+                if persist_list:
+                    print(f"  Approved for persistence ({len(persist_list)}):")
+                    for item in persist_list:
+                        print(f"    + {item.get('triplet', '')}")
+                        print(f"      Reason: {item.get('reason', '')}")
+                
+                if skip_list:
+                    print(f"  Skipped ({len(skip_list)}):")
+                    for item in skip_list:
+                        print(f"    - {item.get('triplet', '')}")
+                        print(f"      Reason: {item.get('reason', '')}")
+            
+            if result.persisted_count > 0:
+                print(f"\n--- Persistence Result ---")
+                print(f"  Persisted {result.persisted_count} triplet(s) to Neo4j")
+            elif result.validated_triplets and not persistence_justification.get("persist"):
+                print(f"\n--- Persistence Result ---")
+                print(f"  No triplets persisted (all skipped by local LLM)")
             
             print(f"\n--- Tool Calls Summary ---")
             print(f"  Total iterations: {result.iterations}")
@@ -542,19 +574,18 @@ def run_validated_expansion_demo(
     print("\n" + "=" * 60)
     print("Dual-LLM Validated Expansion Demo Complete!")
     print("=" * 60)
-    print("\nSummary of Features:")
-    print("  - LLM-based knowledge gap assessment (instead of heuristics)")
-    print("  - Complete triplet coverage: LLM proposes facts for ALL missing info")
-    print("  - ITERATIVE knowledge expansion:")
-    print("      * Search KB -> Assess -> Propose -> Validate -> Persist")
-    print("      * Re-search with new facts and re-assess")
-    print("      * Repeat until knowledge is sufficient or max iterations")
-    print("  - Detailed intermediate messages showing:")
-    print("      * Gap detection with proposed triplets")
-    print("      * Each validation attempt with remote LLM response")
-    print("      * Iteration summaries with progress")
-    print("      * Persistence confirmation")
-    print("  - Up to 3 retry attempts per iteration with feedback loop")
+    print("\nWorkflow:")
+    print("  1. Search KB -> Assess sufficiency (local LLM)")
+    print("  2. If insufficient -> Propose triplets (local LLM)")
+    print("  3. Validate proposed triplets (remote LLM, up to 3 retries)")
+    print("  4. Generate answer using existing + validated facts")
+    print("  5. Justify persistence: local LLM decides which triplets to keep")
+    print("  6. Persist only justified triplets to Neo4j")
+    print("\nKey Features:")
+    print("  - Persistence is DEFERRED until after the answer is generated")
+    print("  - Local LLM acts as quality gate for persistence decisions")
+    print("  - Vague/placeholder triplets are skipped, specific facts are persisted")
+    print("  - Remote model name is shown in all validation output")
     print("  - Graceful failure handling if validation cannot succeed")
 
 

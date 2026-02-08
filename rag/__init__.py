@@ -63,7 +63,6 @@ from .duplicate_detector import DuplicateDetector, DuplicateCheckResult, get_dup
 from .generator import KGRagGenerator, GenerationResult, create_generator
 
 # Knowledge gap detection and validation (for dual-LLM mode)
-from .knowledge_gap_detector import KnowledgeGapDetector, GapAnalysis, get_knowledge_gap_detector
 from .triplet_validator import TripletValidator, ValidationResult, ValidatedTriplet, get_triplet_validator
 
 # Prompt loading utilities
