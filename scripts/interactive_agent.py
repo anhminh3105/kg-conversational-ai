@@ -613,16 +613,18 @@ def run_interactive_session(
                                     print(f"      {Colors.GREEN}→ Found {res['num_results']} results{Colors.RESET}")
                 
                 # Display validation details (before answer)
-                if validation_mode and hasattr(result, 'knowledge_gap_detected'):
-                    display_validation_details(result, verbose=verbose_mode)
+                # Skip when verbose -- run() already printed these inline
+                if validation_mode and hasattr(result, 'knowledge_gap_detected') and not verbose_mode:
+                    display_validation_details(result, verbose=False)
                 
                 # Display answer
                 print(f"\n{Colors.GREEN}{'─' * 50}{Colors.RESET}")
                 print(f"{Colors.GREEN}Agent:{Colors.RESET} {result.answer}")
                 
                 # Display persistence justification (after answer)
-                if validation_mode and hasattr(result, 'persistence_justification'):
-                    display_persistence_details(result, verbose=verbose_mode)
+                # Skip when verbose -- run() already printed these inline
+                if validation_mode and hasattr(result, 'persistence_justification') and not verbose_mode:
+                    display_persistence_details(result, verbose=False)
                 
                 # Update history with answer
                 query_history[-1] = (user_input, result.answer)

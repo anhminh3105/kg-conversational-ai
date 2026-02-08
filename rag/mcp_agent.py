@@ -36,6 +36,33 @@ from .prompts import load_prompt
 
 logger = logging.getLogger(__name__)
 
+# Patterns that indicate a placeholder or generic value in a triplet component
+_PLACEHOLDER_PATTERNS = re.compile(
+    r"(?:^|[_,\s\(])"  # word boundary or triplet delimiter
+    r"(?:"
+    r"Stakeholder_(?:Name|Entity)\d*"
+    r"|Shareholder_(?:Name|Entity)\d*"
+    r"|(?:Name|Entity|Person|Individual|Organization|Company)_?\d+"
+    r"|(?:Person|Entity|Individual)_(?:Name|X|Y|Z)"
+    r"|(?:Name|Entity)_(?:Name|Entity)"
+    r"|Stakeholder_Entity"
+    r"|Shareholder_Entity"
+    r"|Some_Value"
+    r"|Key_Element"
+    r"|Important_Factor"
+    r"|Relevant_Information"
+    r"|Unknown|N/?A|TBD|Various|Multiple|Several"
+    r"|REDACTED|\[REDACTED\]"
+    r")"
+    r"(?:[_,\s\)]|$)",  # word boundary or triplet delimiter
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder_fact(fact: str) -> bool:
+    """Return True if a fact string contains placeholder or generic values."""
+    return bool(_PLACEHOLDER_PATTERNS.search(fact))
+
 
 @dataclass
 class AgentResult:
@@ -842,15 +869,39 @@ class MCPAgentWithValidation:
                 "result": search_data,
             })
             
-            if verbose:
-                print(f"Found {search_data.get('num_results', 0)} facts")
-            
             # Extract facts for assessment
             existing_fact_strings = []
+            kg_fact_count = 0
             for fact in search_data.get("facts", []):
                 fact_str = fact.get("fact", "")
                 existing_fact_strings.append(fact_str)
                 all_known_fact_strings.add(normalize_triplet_string(fact_str))
+                kg_fact_count += 1
+            
+            # Re-add validated facts from previous iterations (deferred persistence
+            # means they are NOT yet in Neo4j, so the KG search won't find them)
+            carried_over_facts = []
+            if all_validated_triplets:
+                for vt in all_validated_triplets:
+                    triplet_str = vt.get("triplet", "")
+                    if triplet_str and triplet_str not in existing_fact_strings:
+                        existing_fact_strings.append(triplet_str)
+                        carried_over_facts.append(triplet_str)
+            
+            if verbose:
+                num_facts = search_data.get('num_results', kg_fact_count)
+                print(f"Found {num_facts} facts from KG:")
+                facts_list = search_data.get("facts", [])
+                for idx, fact_str in enumerate(existing_fact_strings[:kg_fact_count], 1):
+                    score = None
+                    if idx - 1 < len(facts_list):
+                        score = facts_list[idx - 1].get("score")
+                    score_str = f" (score: {score:.4f})" if score is not None else ""
+                    print(f"  {idx:>2}. {fact_str}{score_str}")
+                if carried_over_facts:
+                    print(f"  + {len(carried_over_facts)} validated facts from previous iteration(s):")
+                    for idx, fact_str in enumerate(carried_over_facts, 1):
+                        print(f"    {idx:>2}. {fact_str} [validated]")
             
             # ----------------------------------------------------------
             # Step 2: LLM-based knowledge sufficiency assessment
@@ -979,31 +1030,68 @@ class MCPAgentWithValidation:
                 for vt in validated_triplets:
                     triplet_str = vt.get("triplet", "")
                     all_known_fact_strings.add(normalize_triplet_string(triplet_str))
-                    # Add to existing_fact_strings so next iteration sees them
+                    # Add to existing_fact_strings so re-assessment sees them
                     existing_fact_strings.append(triplet_str)
-            
-            # ----------------------------------------------------------
-            # Generate iteration summary
-            # ----------------------------------------------------------
-            will_continue = knowledge_iteration < self.max_knowledge_iterations
-            iteration_summary = self._generate_iteration_summary_message(
-                iteration=knowledge_iteration,
-                max_iterations=self.max_knowledge_iterations,
-                validated_count=len(validated_triplets),
-                rejected_count=len(iteration_rejected),
-                persisted_count=0,  # Deferred until after answer
-                assessment=llm_assessment["assessment"],
-                will_continue=will_continue,
-            )
-            intermediate_messages.append(iteration_summary)
-            if verbose:
-                print(iteration_summary)
             
             # If no triplets were validated, we can't make progress
             if not validated_triplets:
                 if verbose:
                     print(f"\n[Iteration {knowledge_iteration}] No triplets validated - cannot make progress")
                 break
+            
+            # ----------------------------------------------------------
+            # Step 6: Re-assess sufficiency with validated facts included
+            # ----------------------------------------------------------
+            if verbose:
+                print(f"\n--- Iteration {knowledge_iteration}, Step 3: Re-assessing with {len(validated_triplets)} validated facts included ---")
+            
+            re_assessment = self._assess_knowledge_sufficiency(
+                query, existing_fact_strings, temperature
+            )
+            
+            re_sufficient = re_assessment["assessment"] != "INSUFFICIENT"
+            
+            if verbose:
+                print(f"Re-assessment: {re_assessment['assessment']} (confidence: {re_assessment['confidence']:.2f})")
+            
+            # Generate iteration summary
+            will_continue = not re_sufficient and knowledge_iteration < self.max_knowledge_iterations
+            iteration_summary = self._generate_iteration_summary_message(
+                iteration=knowledge_iteration,
+                max_iterations=self.max_knowledge_iterations,
+                validated_count=len(validated_triplets),
+                rejected_count=len(iteration_rejected),
+                persisted_count=0,  # Deferred until after answer
+                assessment=re_assessment["assessment"],
+                will_continue=will_continue,
+            )
+            intermediate_messages.append(iteration_summary)
+            if verbose:
+                print(iteration_summary)
+            
+            # If re-assessment says sufficient, we're done
+            if re_sufficient:
+                if verbose:
+                    print(f"\n[Iteration {knowledge_iteration}] Knowledge now SUFFICIENT after validation - proceeding to answer generation")
+                break
+            
+            # Check if the re-assessment proposed new non-duplicate triplets
+            re_proposed = re_assessment.get("proposed_triplets", [])
+            new_re_proposed = []
+            for triplet in re_proposed:
+                if isinstance(triplet, (list, tuple)) and len(triplet) >= 3:
+                    triplet_str = f"{triplet[0]}|{triplet[1]}|{triplet[2]}"
+                    normalized = normalize_triplet_string(triplet_str)
+                    if normalized not in all_known_fact_strings:
+                        new_re_proposed.append(triplet)
+            
+            if not new_re_proposed:
+                if verbose:
+                    print(f"\n[Iteration {knowledge_iteration}] No new triplets to propose after re-assessment - proceeding to answer generation")
+                break
+            
+            if verbose:
+                print(f"\n[Iteration {knowledge_iteration}] Re-assessment found {len(new_re_proposed)} new triplets to try in next iteration")
         
         # ============================================================
         # GENERATE FINAL ANSWER
@@ -1022,6 +1110,10 @@ class MCPAgentWithValidation:
                 final_fact_strings.append(triplet_str)
                 validated_fact_strings.append(triplet_str)
         
+        # Filter out placeholder/generic facts before passing to the LLM
+        final_fact_strings = [f for f in final_fact_strings if not _is_placeholder_fact(f)]
+        validated_fact_strings = [f for f in validated_fact_strings if not _is_placeholder_fact(f)]
+        
         system_prompt = self._get_answer_prompt(
             knowledge_gap_detected,
             len(all_validated_triplets) > 0,
@@ -1031,25 +1123,25 @@ class MCPAgentWithValidation:
         
         facts_context = "\n".join(f"- {f}" for f in final_fact_strings)
         
-        # Build context about validated triplets for the answer prompt
+        # Build the user message for answer generation
         if validated_fact_strings:
-            validated_context = "\n".join(f"- {f} [validated by {remote_model_name}]" for f in validated_fact_strings)
+            validated_context = "\n".join(f"- {f}" for f in validated_fact_strings)
             user_message = f"""Question: {query}
 
-Available facts from knowledge graph:
+Facts:
 {facts_context}
 
-Additionally, the following {len(validated_fact_strings)} fact(s) were proposed to fill knowledge gaps and validated by {remote_model_name}:
+Newly validated facts:
 {validated_context}
 
-The knowledge graph did not have sufficient information to answer this question directly. Please answer the question using both the existing facts and the validated facts above. Be concise and accurate. Clearly state that the knowledge graph was insufficient and that you are supplementing with {len(validated_fact_strings)} validated fact(s)."""
+Answer the question naturally based on these facts. Ignore any facts with placeholder or generic values."""
         else:
             user_message = f"""Question: {query}
 
-Available facts from knowledge graph:
+Facts:
 {facts_context}
 
-Please answer the question based on these facts. Be concise and accurate."""
+Answer the question naturally based on these facts. Ignore any facts with placeholder or generic values."""
         
         history = [{"role": "user", "content": user_message}]
         
@@ -1684,9 +1776,14 @@ Please propose NEW, DIFFERENT triplets that address the missing information whil
         
         system_prompt = load_prompt("persistence_justification")
         
+        # Build a numbered list so the LLM knows exactly which triplets to decide on
         triplets_text = "\n".join(
-            f"- {vt.get('triplet', '')}" for vt in validated_triplets
+            f"{i+1}. {vt.get('triplet', '')}"
+            for i, vt in enumerate(validated_triplets)
         )
+        
+        # Build the set of allowed triplet strings for cross-checking later
+        allowed_triplets = {vt.get("triplet", "") for vt in validated_triplets}
         
         user_message = f"""## Question
 {query}
@@ -1694,10 +1791,10 @@ Please propose NEW, DIFFERENT triplets that address the missing information whil
 ## Answer Produced
 {answer}
 
-## Validated Triplets to Evaluate
+## Validated Triplets to Evaluate (you may ONLY decide on these {len(validated_triplets)} triplets)
 {triplets_text}
 
-Decide which triplets should be persisted to the knowledge graph. Respond with JSON."""
+For each triplet above, decide whether to persist or skip. Do NOT add any triplets that are not in the numbered list. Respond with JSON."""
         
         history = [{"role": "user", "content": user_message}]
         
@@ -1753,11 +1850,42 @@ Decide which triplets should be persisted to the knowledge graph. Respond with J
                         "reason": item.get("reason", "Skipped"),
                     })
             
+            # Cross-check: only keep triplets that were actually validated
+            # This prevents the LLM from hallucinating new triplets
+            checked_persist = [
+                item for item in valid_persist
+                if item["triplet"] in allowed_triplets
+            ]
+            checked_skip = [
+                item for item in valid_skip
+                if item["triplet"] in allowed_triplets
+            ]
+            
+            # Log any hallucinated triplets that were filtered out
+            hallucinated = (
+                [item for item in valid_persist if item["triplet"] not in allowed_triplets]
+                + [item for item in valid_skip if item["triplet"] not in allowed_triplets]
+            )
+            if hallucinated:
+                logger.warning(
+                    f"Filtered {len(hallucinated)} hallucinated triplet(s) from persistence justification: "
+                    f"{[h['triplet'] for h in hallucinated]}"
+                )
+            
+            # Any validated triplets the LLM didn't mention go to persist by default
+            mentioned = {item["triplet"] for item in checked_persist + checked_skip}
+            for triplet_str in allowed_triplets:
+                if triplet_str and triplet_str not in mentioned:
+                    checked_persist.append({
+                        "triplet": triplet_str,
+                        "reason": "Fallback: not mentioned by LLM, persisting by default",
+                    })
+            
             # If the LLM returned empty persist and skip, fall back to persisting all
-            if not valid_persist and not valid_skip:
+            if not checked_persist and not checked_skip:
                 return default_result
             
-            return {"persist": valid_persist, "skip": valid_skip}
+            return {"persist": checked_persist, "skip": checked_skip}
             
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.warning(f"Failed to parse persistence justification response: {e}")

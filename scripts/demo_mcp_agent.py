@@ -457,103 +457,107 @@ def run_validated_expansion_demo(
                 for msg in result.intermediate_messages:
                     print(msg)
             
-            # Display LLM Assessment details
-            if result.llm_assessment:
-                print(f"\n--- LLM Assessment Details ---")
-                assessment = result.llm_assessment
-                print(f"  Assessment: {assessment.get('assessment', 'N/A')}")
-                print(f"  Confidence: {assessment.get('confidence', 0):.2f}")
-                
-                if assessment.get('missing_information'):
-                    print(f"  Missing information ({len(assessment['missing_information'])} items):")
-                    for item in assessment['missing_information']:
-                        print(f"    - {item}")
-                
-                if assessment.get('answer'):
-                    partial = assessment['answer'][:100] + "..." if len(assessment.get('answer', '')) > 100 else assessment['answer']
-                    print(f"  Partial answer: {partial}")
-            
-            # Display validation statistics with remote model name
+            # Display post-run summary only when NOT verbose
+            # (verbose mode already prints these details inline during run())
             result_remote_model = getattr(result, 'remote_model_name', '') or remote_model
-            print(f"\n--- Validation Summary ---")
-            print(f"  Remote model used:     {result_remote_model}")
-            print(f"  Knowledge iterations:  {result.knowledge_iterations}")
-            print(f"  Knowledge gap detected:{result.knowledge_gap_detected}")
-            print(f"  Validation attempts:   {result.validation_attempts}")
-            print(f"  Validation failed:     {result.validation_failed}")
             
-            if result.proposed_triplets:
-                print(f"\n--- Proposed Triplets (Local LLM) ---")
-                print(f"  Count: {len(result.proposed_triplets)}")
-                for t in result.proposed_triplets:
-                    print(f"    + {t}")
+            if not verbose:
+                # Display LLM Assessment details
+                if result.llm_assessment:
+                    print(f"\n--- LLM Assessment Details ---")
+                    assessment = result.llm_assessment
+                    print(f"  Assessment: {assessment.get('assessment', 'N/A')}")
+                    print(f"  Confidence: {assessment.get('confidence', 0):.2f}")
+                    
+                    if assessment.get('missing_information'):
+                        print(f"  Missing information ({len(assessment['missing_information'])} items):")
+                        for item in assessment['missing_information']:
+                            print(f"    - {item}")
+                    
+                    if assessment.get('answer'):
+                        partial = assessment['answer'][:100] + "..." if len(assessment.get('answer', '')) > 100 else assessment['answer']
+                        print(f"  Partial answer: {partial}")
+                
+                # Display validation statistics with remote model name
+                print(f"\n--- Validation Summary ---")
+                print(f"  Remote model used:     {result_remote_model}")
+                print(f"  Knowledge iterations:  {result.knowledge_iterations}")
+                print(f"  Knowledge gap detected:{result.knowledge_gap_detected}")
+                print(f"  Validation attempts:   {result.validation_attempts}")
+                print(f"  Validation failed:     {result.validation_failed}")
+                
+                if result.proposed_triplets:
+                    print(f"\n--- Proposed Triplets (Local LLM) ---")
+                    print(f"  Count: {len(result.proposed_triplets)}")
+                    for t in result.proposed_triplets:
+                        print(f"    + {t}")
+                
+                if result.validated_triplets:
+                    print(f"\n--- Validated Triplets ({result_remote_model}) ---")
+                    print(f"  Count: {len(result.validated_triplets)}")
+                    for vt in result.validated_triplets:
+                        status = vt.get('status', 'unknown')
+                        triplet = vt.get('triplet', '')
+                        reason = vt.get('reason', '')
+                        print(f"    [{status}] {triplet}")
+                        if reason:
+                            print(f"            Reason: {reason}")
+                
+                if result.rejected_triplets:
+                    print(f"\n--- Rejected Triplets (All Attempts) ---")
+                    print(f"  Count: {len(result.rejected_triplets)}")
+                    for rt in result.rejected_triplets:
+                        triplet = rt.get('triplet', '')
+                        reason = rt.get('reason', '')
+                        print(f"    [rejected] {triplet}")
+                        if reason:
+                            print(f"               Reason: {reason}")
+                
+                # Display validation history if available
+                if result.validation_history:
+                    print(f"\n--- Validation History ---")
+                    for vh in result.validation_history:
+                        attempt = vh.get('attempt', '?')
+                        all_rejected = vh.get('all_rejected', False)
+                        validated = vh.get('validated', [])
+                        rejected = vh.get('rejected', [])
+                        vh_model = vh.get('remote_model', result_remote_model)
+                        ki = vh.get('knowledge_iteration', '')
+                        ki_label = f"Iter {ki}, " if ki else ""
+                        status = "ALL REJECTED" if all_rejected else f"{len(validated)} accepted"
+                        print(f"  {ki_label}Attempt {attempt} ({vh_model}): {status}, {len(rejected)} rejected")
             
-            if result.validated_triplets:
-                print(f"\n--- Validated Triplets ({result_remote_model}) ---")
-                print(f"  Count: {len(result.validated_triplets)}")
-                for vt in result.validated_triplets:
-                    status = vt.get('status', 'unknown')
-                    triplet = vt.get('triplet', '')
-                    reason = vt.get('reason', '')
-                    print(f"    [{status}] {triplet}")
-                    if reason:
-                        print(f"            Reason: {reason}")
-            
-            if result.rejected_triplets:
-                print(f"\n--- Rejected Triplets (All Attempts) ---")
-                print(f"  Count: {len(result.rejected_triplets)}")
-                for rt in result.rejected_triplets:
-                    triplet = rt.get('triplet', '')
-                    reason = rt.get('reason', '')
-                    print(f"    [rejected] {triplet}")
-                    if reason:
-                        print(f"               Reason: {reason}")
-            
-            # Display validation history if available
-            if result.validation_history:
-                print(f"\n--- Validation History ---")
-                for vh in result.validation_history:
-                    attempt = vh.get('attempt', '?')
-                    all_rejected = vh.get('all_rejected', False)
-                    validated = vh.get('validated', [])
-                    rejected = vh.get('rejected', [])
-                    vh_model = vh.get('remote_model', result_remote_model)
-                    ki = vh.get('knowledge_iteration', '')
-                    ki_label = f"Iter {ki}, " if ki else ""
-                    status = "ALL REJECTED" if all_rejected else f"{len(validated)} accepted"
-                    print(f"  {ki_label}Attempt {attempt} ({vh_model}): {status}, {len(rejected)} rejected")
-            
-            # Display the answer BEFORE persistence details
+            # Always display the final answer
             print(f"\n--- Final Answer ---")
             print(result.answer)
             
-            # Display persistence justification (after answer)
-            persistence_justification = getattr(result, 'persistence_justification', {})
-            skipped_triplets = getattr(result, 'skipped_triplets', [])
-            
-            if persistence_justification:
-                persist_list = persistence_justification.get("persist", [])
-                skip_list = persistence_justification.get("skip", [])
+            # Display persistence justification only when NOT verbose
+            if not verbose:
+                persistence_justification = getattr(result, 'persistence_justification', {})
                 
-                print(f"\n--- Persistence Justification (Local LLM) ---")
-                if persist_list:
-                    print(f"  Approved for persistence ({len(persist_list)}):")
-                    for item in persist_list:
-                        print(f"    + {item.get('triplet', '')}")
-                        print(f"      Reason: {item.get('reason', '')}")
+                if persistence_justification:
+                    persist_list = persistence_justification.get("persist", [])
+                    skip_list = persistence_justification.get("skip", [])
+                    
+                    print(f"\n--- Persistence Justification (Local LLM) ---")
+                    if persist_list:
+                        print(f"  Approved for persistence ({len(persist_list)}):")
+                        for item in persist_list:
+                            print(f"    + {item.get('triplet', '')}")
+                            print(f"      Reason: {item.get('reason', '')}")
+                    
+                    if skip_list:
+                        print(f"  Skipped ({len(skip_list)}):")
+                        for item in skip_list:
+                            print(f"    - {item.get('triplet', '')}")
+                            print(f"      Reason: {item.get('reason', '')}")
                 
-                if skip_list:
-                    print(f"  Skipped ({len(skip_list)}):")
-                    for item in skip_list:
-                        print(f"    - {item.get('triplet', '')}")
-                        print(f"      Reason: {item.get('reason', '')}")
-            
-            if result.persisted_count > 0:
-                print(f"\n--- Persistence Result ---")
-                print(f"  Persisted {result.persisted_count} triplet(s) to Neo4j")
-            elif result.validated_triplets and not persistence_justification.get("persist"):
-                print(f"\n--- Persistence Result ---")
-                print(f"  No triplets persisted (all skipped by local LLM)")
+                if result.persisted_count > 0:
+                    print(f"\n--- Persistence Result ---")
+                    print(f"  Persisted {result.persisted_count} triplet(s) to Neo4j")
+                elif result.validated_triplets and not getattr(result, 'persistence_justification', {}).get("persist"):
+                    print(f"\n--- Persistence Result ---")
+                    print(f"  No triplets persisted (all skipped by local LLM)")
             
             print(f"\n--- Tool Calls Summary ---")
             print(f"  Total iterations: {result.iterations}")
