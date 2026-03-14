@@ -107,6 +107,13 @@ def index_mode(args: argparse.Namespace) -> None:
     print(f"  - {args.prefix}_config.json (config)")
 
 
+def _parse_filter_list(value):
+    """Parse a comma-separated CLI string into a list or None."""
+    if not value:
+        return None
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
 def search_mode(args: argparse.Namespace) -> None:
     """Run search on an existing index (without LLM generation)."""
     logger = logging.getLogger(__name__)
@@ -120,11 +127,29 @@ def search_mode(args: argparse.Namespace) -> None:
         use_gpu_faiss=args.gpu_faiss,
     )
 
+    predicate_filter = _parse_filter_list(getattr(args, "predicate_filter", None))
+    node_type_filter = _parse_filter_list(getattr(args, "node_type_filter", None))
+    auto_filter = getattr(args, "auto_filter", False)
+
+    if auto_filter and not predicate_filter:
+        from rag.predicate_selector import PredicateSelector
+        available = indexer.get_unique_predicates()
+        if available and args.query:
+            selector = PredicateSelector()
+            selected = selector.select(args.query, available)
+            if selected:
+                logger.info("Auto-selected predicates: %s", selected)
+                predicate_filter = selected
+
     if args.interactive:
-        interactive_search(indexer, args.top_k)
+        interactive_search(indexer, args.top_k, predicate_filter, node_type_filter)
     elif args.query:
-        # Single query
-        results = indexer.search(args.query, top_k=args.top_k)
+        results = indexer.search(
+            args.query,
+            top_k=args.top_k,
+            predicate_filter=predicate_filter,
+            node_type_filter=node_type_filter,
+        )
         print_search_results(args.query, results)
     else:
         print("No query provided. Use --query or --interactive")
@@ -167,6 +192,10 @@ def generate_mode(args: argparse.Namespace) -> None:
     if persist_expanded:
         logger.info(f"Triplet persistence enabled (threshold={similarity_threshold}, auto-save=on)")
 
+    predicate_filter = _parse_filter_list(getattr(args, "predicate_filter", None))
+    node_type_filter = _parse_filter_list(getattr(args, "node_type_filter", None))
+    auto_filter_flag = getattr(args, "auto_filter", False)
+
     if args.interactive:
         interactive_generate(
             generator,
@@ -177,9 +206,11 @@ def generate_mode(args: argparse.Namespace) -> None:
             max_expansion=max_expansion,
             persist_expanded=persist_expanded,
             similarity_threshold=similarity_threshold,
+            predicate_filter=predicate_filter,
+            node_type_filter=node_type_filter,
+            auto_filter=auto_filter_flag,
         )
     elif args.query:
-        # Single query
         result = generator.generate(
             args.query,
             top_k=args.top_k,
@@ -188,18 +219,30 @@ def generate_mode(args: argparse.Namespace) -> None:
             expand_triplets=expand_triplets,
             max_expansion=max_expansion,
             persist_expanded=persist_expanded,
-            auto_save=persist_expanded,  # Auto-save when persist is enabled
+            auto_save=persist_expanded,
             similarity_threshold=similarity_threshold,
+            predicate_filter=predicate_filter,
+            node_type_filter=node_type_filter,
+            auto_filter=auto_filter_flag,
         )
         print_generation_result(result)
     else:
         print("No query provided. Use --query or --interactive")
 
 
-def interactive_search(indexer: KGRagIndexer, top_k: int = 10) -> None:
+def interactive_search(
+    indexer: KGRagIndexer,
+    top_k: int = 10,
+    predicate_filter=None,
+    node_type_filter=None,
+) -> None:
     """Interactive search loop (retrieval only)."""
     print("\n" + "=" * 60)
     print("Interactive Search Mode (retrieval only)")
+    if predicate_filter:
+        print(f"Predicate filter: {predicate_filter}")
+    if node_type_filter:
+        print(f"Node-type filter: {node_type_filter}")
     print("Type 'quit' or 'exit' to stop")
     print("=" * 60 + "\n")
 
@@ -214,7 +257,12 @@ def interactive_search(indexer: KGRagIndexer, top_k: int = 10) -> None:
                 print("Goodbye!")
                 break
 
-            results = indexer.search(query, top_k=top_k)
+            results = indexer.search(
+                query,
+                top_k=top_k,
+                predicate_filter=predicate_filter,
+                node_type_filter=node_type_filter,
+            )
             print_search_results(query, results)
 
         except KeyboardInterrupt:
@@ -233,6 +281,9 @@ def interactive_generate(
     max_expansion: int = 10,
     persist_expanded: bool = False,
     similarity_threshold: float = 0.95,
+    predicate_filter=None,
+    node_type_filter=None,
+    auto_filter: bool = False,
 ) -> None:
     """Interactive Q&A loop with LLM generation."""
     print("\n" + "=" * 60)
@@ -241,6 +292,12 @@ def interactive_generate(
         print(f"Triplet expansion: ENABLED (max {max_expansion} triplets)")
     if persist_expanded:
         print(f"Triplet persistence: ENABLED (threshold={similarity_threshold}, auto-save=on)")
+    if auto_filter:
+        print("Auto predicate filter: ENABLED (LLM selects predicates per query)")
+    elif predicate_filter:
+        print(f"Predicate filter: {predicate_filter}")
+    if node_type_filter:
+        print(f"Node-type filter: {node_type_filter}")
     print("Type 'quit' or 'exit' to stop")
     print("=" * 60 + "\n")
 
@@ -264,8 +321,11 @@ def interactive_generate(
                 expand_triplets=expand_triplets,
                 max_expansion=max_expansion,
                 persist_expanded=persist_expanded,
-                auto_save=persist_expanded,  # Auto-save when persist is enabled
+                auto_save=persist_expanded,
                 similarity_threshold=similarity_threshold,
+                predicate_filter=predicate_filter,
+                node_type_filter=node_type_filter,
+                auto_filter=auto_filter,
             )
             print_generation_result(result)
 
@@ -383,6 +443,15 @@ Examples:
 
   # Interactive search (retrieval only)
   python scripts/index_rag.py --load ./output/rag --interactive
+
+  # Auto-filter: LLM selects predicates from the query automatically
+  python scripts/index_rag.py --load ./output/rag_primekb --generate --auto_filter --query "What drugs treat diabetes?"
+
+  # Manual predicate filter (comma-separated)
+  python scripts/index_rag.py --load ./output/rag_primekb --predicate_filter treats --query "What drugs treat diabetes?"
+
+  # Manual node-type filter
+  python scripts/index_rag.py --load ./output/rag_primekb --node_type_filter drug,disease --query "What drugs treat diabetes?"
         """,
     )
 
@@ -539,6 +608,23 @@ Examples:
         default=0.95,
         dest="similarity_threshold",
         help="Cosine similarity threshold for duplicate detection (default: 0.95)",
+    )
+
+    # Metadata filtering options (search & generate modes)
+    parser.add_argument(
+        "--predicate_filter",
+        default=None,
+        help="Comma-separated predicate filter for search/generate (e.g. treats,indication)",
+    )
+    parser.add_argument(
+        "--node_type_filter",
+        default=None,
+        help="Comma-separated node-type filter for search/generate (e.g. drug,disease)",
+    )
+    parser.add_argument(
+        "--auto_filter",
+        action="store_true",
+        help="Use the LLM to automatically select predicate filters from the query",
     )
 
     # Logging

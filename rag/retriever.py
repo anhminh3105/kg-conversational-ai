@@ -11,6 +11,7 @@ from enum import Enum
 
 from .kg_rag_indexer import KGRagIndexer
 from .faiss_store import SearchResult
+from .predicate_selector import PredicateSelector
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,9 @@ class KGRetriever:
         top_k: int = 10,
         format: Optional[ContextFormat] = None,
         min_score: float = 0.0,
+        predicate_filter: Optional[List[str]] = None,
+        node_type_filter: Optional[List[str]] = None,
+        auto_filter: bool = False,
     ) -> RetrievalResult:
         """
         Retrieve relevant triplets for a query.
@@ -87,16 +91,32 @@ class KGRetriever:
             top_k: Maximum number of results
             format: Output format (defaults to self.default_format)
             min_score: Minimum relevance score threshold
+            predicate_filter: Explicit predicate filter (overrides auto)
+            node_type_filter: Explicit node-type filter
+            auto_filter: When True and no explicit predicate_filter given,
+                         use the LLM to select predicates automatically
             
         Returns:
             RetrievalResult with triplets and formatted context
         """
         format = format or self.default_format
+
+        if auto_filter and not predicate_filter:
+            available = self.indexer.get_unique_predicates()
+            if available:
+                selector = PredicateSelector()
+                selected = selector.select(query, available)
+                if selected:
+                    logger.info("Auto-selected predicates: %s", selected)
+                    predicate_filter = selected
+
+        search_results = self.indexer.search(
+            query,
+            top_k=top_k,
+            predicate_filter=predicate_filter,
+            node_type_filter=node_type_filter,
+        )
         
-        # Search using the indexer
-        search_results = self.indexer.search(query, top_k=top_k)
-        
-        # Filter by minimum score
         if min_score > 0:
             search_results = [r for r in search_results if r.score >= min_score]
         

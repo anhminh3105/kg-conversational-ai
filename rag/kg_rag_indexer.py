@@ -304,6 +304,8 @@ class KGRagIndexer:
         query: str,
         top_k: int = 10,
         use_instruction: bool = True,
+        predicate_filter: Optional[List[str]] = None,
+        node_type_filter: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """
         Search for relevant triplets given a query.
@@ -312,21 +314,41 @@ class KGRagIndexer:
             query: Natural language query
             top_k: Number of results to return
             use_instruction: Whether to use instruction prefix for query
+            predicate_filter: Allowed predicate values (post-filter, FAISS only)
+            node_type_filter: Allowed node types (post-filter, FAISS only)
             
         Returns:
             List of SearchResult objects
         """
-        # Embed query
         query_embedding = self.embedder.embed_query(
             query,
             use_instruction=use_instruction,
             normalize=True,
         )
         
-        # Search
-        results = self.store.search(query_embedding, top_k=top_k)
+        has_filters = bool(predicate_filter or node_type_filter)
+        if has_filters and self.store_type == "faiss":
+            results = self.store.search_filtered(
+                query_embedding,
+                top_k=top_k,
+                predicate_filter=predicate_filter,
+                node_type_filter=node_type_filter,
+            )
+        else:
+            results = self.store.search(query_embedding, top_k=top_k)
         
         return results
+
+    def get_unique_predicates(self) -> List[str]:
+        """Return the sorted list of unique predicate values from the index metadata."""
+        if self._store is None:
+            return []
+        predicates = {
+            meta.get("predicate", "")
+            for meta in self.store.metadata
+            if meta.get("predicate")
+        }
+        return sorted(predicates)
     
     def search_batch(
         self,

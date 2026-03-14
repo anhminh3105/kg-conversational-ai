@@ -146,6 +146,82 @@ class FaissStore:
         
         return results
     
+    def search_filtered(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int = 10,
+        predicate_filter: Optional[List[str]] = None,
+        node_type_filter: Optional[List[str]] = None,
+        fetch_multiplier: int = 10,
+    ) -> List[SearchResult]:
+        """
+        Search with post-filtering on metadata fields.
+
+        Over-fetches candidates from FAISS, then filters by predicate
+        and/or node type before returning the final top_k.
+
+        Args:
+            query_embedding: Query vector of shape (embedding_dim,) or (1, embedding_dim)
+            top_k: Number of results to return after filtering
+            predicate_filter: Allowed predicate values (case-insensitive exact match)
+            node_type_filter: Allowed node types checked against x_type/y_type in source_text
+            fetch_multiplier: How many multiples of top_k to fetch from FAISS
+
+        Returns:
+            List of SearchResult objects (at most top_k)
+        """
+        has_filters = bool(predicate_filter or node_type_filter)
+        if not has_filters:
+            return self.search(query_embedding, top_k=top_k)
+
+        fetch_k = min(top_k * fetch_multiplier, self.index.ntotal)
+
+        if query_embedding.ndim == 1:
+            query_embedding = query_embedding.reshape(1, -1)
+        query_embedding = np.ascontiguousarray(query_embedding.astype(np.float32))
+
+        scores, indices = self.index.search(query_embedding, fetch_k)
+
+        pred_set = {p.lower() for p in predicate_filter} if predicate_filter else None
+        node_set = {n.lower() for n in node_type_filter} if node_type_filter else None
+
+        filtered: List[SearchResult] = []
+        rank = 0
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0:
+                continue
+            meta = self.metadata[idx]
+
+            if pred_set:
+                pred_val = meta.get("predicate", "").lower()
+                if pred_val not in pred_set:
+                    continue
+
+            if node_set:
+                src = meta.get("source_text", "").lower()
+                matched = False
+                for nt in node_set:
+                    if f"x_type={nt}" in src or f"y_type={nt}" in src:
+                        matched = True
+                        break
+                if not matched:
+                    continue
+
+            filtered.append(SearchResult(score=float(score), metadata=meta, rank=rank))
+            rank += 1
+            if rank >= top_k:
+                break
+
+        if not filtered:
+            logger.warning(
+                "No results matched filters (predicate=%s, node_type=%s). "
+                "Falling back to unfiltered search.",
+                predicate_filter, node_type_filter,
+            )
+            return self.search(query_embedding, top_k=top_k)
+
+        return filtered
+
     def search_batch(
         self,
         query_embeddings: np.ndarray,

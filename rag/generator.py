@@ -144,6 +144,9 @@ class KGRagGenerator:
         persist_expanded: bool = False,
         auto_save: bool = False,
         similarity_threshold: float = 0.95,
+        predicate_filter: Optional[List[str]] = None,
+        node_type_filter: Optional[List[str]] = None,
+        auto_filter: bool = False,
     ) -> GenerationResult:
         """
         Generate an answer using the full RAG pipeline.
@@ -161,6 +164,9 @@ class KGRagGenerator:
             persist_expanded: Whether to persist expanded triplets to the index
             auto_save: Whether to auto-save the index after persisting triplets
             similarity_threshold: Cosine similarity threshold for duplicate detection
+            predicate_filter: Explicit predicate filter for retrieval
+            node_type_filter: Explicit node-type filter for retrieval
+            auto_filter: Use LLM to auto-select predicates before retrieval
             
         Returns:
             GenerationResult with answer and sources
@@ -169,7 +175,13 @@ class KGRagGenerator:
         
         # Step 5: Retrieve relevant triplets
         logger.debug("Step 5: Retrieving relevant triplets...")
-        context = self.retriever.retrieve(query, top_k=top_k)
+        context = self.retriever.retrieve(
+            query,
+            top_k=top_k,
+            predicate_filter=predicate_filter,
+            node_type_filter=node_type_filter,
+            auto_filter=auto_filter,
+        )
         logger.debug(f"Retrieved {len(context)} triplets")
         
         # Step 5.5: Expand triplets using LLM (optional)
@@ -301,6 +313,9 @@ class KGRagGenerator:
         persist_expanded: bool = False,
         auto_save: bool = False,
         similarity_threshold: float = 0.95,
+        predicate_filter: Optional[List[str]] = None,
+        node_type_filter: Optional[List[str]] = None,
+        auto_filter: bool = False,
     ) -> List[GenerationResult]:
         """
         Generate answers for multiple queries.
@@ -315,6 +330,9 @@ class KGRagGenerator:
             persist_expanded: Whether to persist expanded triplets to the index
             auto_save: Whether to auto-save the index after persisting triplets
             similarity_threshold: Cosine similarity threshold for duplicate detection
+            predicate_filter: Explicit predicate filter for retrieval
+            node_type_filter: Explicit node-type filter for retrieval
+            auto_filter: Use LLM to auto-select predicates before retrieval
             
         Returns:
             List of GenerationResult objects
@@ -331,6 +349,9 @@ class KGRagGenerator:
                 persist_expanded=persist_expanded,
                 auto_save=False,  # Don't auto-save on each query in batch
                 similarity_threshold=similarity_threshold,
+                predicate_filter=predicate_filter,
+                node_type_filter=node_type_filter,
+                auto_filter=auto_filter,
             )
             results.append(result)
         

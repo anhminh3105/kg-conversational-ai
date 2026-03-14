@@ -69,6 +69,7 @@ from .retriever import KGRetriever, RetrievalResult, ContextFormat
 from .prompt_builder import KGPromptBuilder, get_prompt_builder
 from .triplet_expander import TripletExpander, get_triplet_expander
 from .duplicate_detector import DuplicateDetector, DuplicateCheckResult, get_duplicate_detector
+from .predicate_selector import PredicateSelector
 from .generator import KGRagGenerator, GenerationResult, create_generator
 
 # Knowledge gap detection and validation (for dual-LLM mode)
@@ -153,6 +154,9 @@ __all__ = [
     "ValidationResult",
     "ValidatedTriplet",
     "get_triplet_validator",
+    
+    # Predicate Selection (LLM-driven auto-filter)
+    "PredicateSelector",
     
     # Duplicate Detection (for offline persistence)
     "DuplicateDetector",
