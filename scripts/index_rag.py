@@ -27,6 +27,12 @@ Usage:
 
     # Interactive Q&A with LLM, expansion, and persistence
     python scripts/index_rag.py --load ./output/rag --generate --expand --persist --interactive
+
+    # Index into Neo4j backend (requires Neo4j running; set env with: source export_dual_llm.sh)
+    python scripts/index_rag.py --input ./rag/edc/output/tmp --store_type neo4j --output_dir ./output/rag_neo4j
+
+    # Search/generate from Neo4j backend
+    python scripts/index_rag.py --load ./output/rag_neo4j --generate --query "Where is Trane located?"
 """
 
 import argparse
@@ -38,6 +44,17 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rag import KGRagIndexer
+
+
+def _resolve_neo4j_args(args):
+    """Resolve Neo4j connection params from CLI args or environment variables."""
+    return dict(
+        store_type=getattr(args, "store_type", "faiss"),
+        neo4j_uri=getattr(args, "neo4j_uri", None) or os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
+        neo4j_user=getattr(args, "neo4j_user", None) or os.environ.get("NEO4J_USER", "neo4j"),
+        neo4j_password=getattr(args, "neo4j_password", None) or os.environ.get("NEO4J_PASSWORD"),
+        neo4j_database=getattr(args, "neo4j_database", "neo4j"),
+    )
 
 
 def setup_logging(level: str) -> None:
@@ -58,11 +75,12 @@ def index_mode(args: argparse.Namespace) -> None:
     logger.info("KG-RAG Indexer")
     logger.info("=" * 60)
 
-    # Create indexer
+    neo4j_kwargs = _resolve_neo4j_args(args)
     indexer = KGRagIndexer(
         embedding_model=args.embedding_model,
         device=args.device,
         use_gpu_faiss=args.gpu_faiss,
+        **neo4j_kwargs,
     )
 
     # Parse comma-separated filter lists
@@ -101,10 +119,16 @@ def index_mode(args: argparse.Namespace) -> None:
     logger.info("=" * 60)
 
     print(f"\nIndex saved to: {args.output_dir}")
-    print(f"Files created:")
-    print(f"  - {args.prefix}.faiss (FAISS index)")
-    print(f"  - {args.prefix}_meta.json (metadata)")
-    print(f"  - {args.prefix}_config.json (config)")
+    if neo4j_kwargs["store_type"] == "neo4j":
+        print(f"Files created:")
+        print(f"  - {args.prefix}_config.json (config)")
+        print(f"  - {args.prefix}_neo4j_config.json (Neo4j connection)")
+        print(f"  Data persisted in Neo4j at {neo4j_kwargs['neo4j_uri']}")
+    else:
+        print(f"Files created:")
+        print(f"  - {args.prefix}.faiss (FAISS index)")
+        print(f"  - {args.prefix}_meta.json (metadata)")
+        print(f"  - {args.prefix}_config.json (config)")
 
 
 def _parse_filter_list(value):
@@ -118,13 +142,14 @@ def search_mode(args: argparse.Namespace) -> None:
     """Run search on an existing index (without LLM generation)."""
     logger = logging.getLogger(__name__)
 
-    # Load indexer
+    neo4j_kwargs = _resolve_neo4j_args(args)
     logger.info(f"Loading index from {args.load}")
     indexer = KGRagIndexer.load(
         args.load,
         prefix=args.prefix,
         device=args.device,
         use_gpu_faiss=args.gpu_faiss,
+        neo4j_password=neo4j_kwargs["neo4j_password"],
     )
 
     predicate_filter = _parse_filter_list(getattr(args, "predicate_filter", None))
@@ -159,16 +184,16 @@ def generate_mode(args: argparse.Namespace) -> None:
     """Run full RAG pipeline with LLM generation."""
     logger = logging.getLogger(__name__)
 
-    # Import generator (requires LLM dependencies)
     from rag import KGRagGenerator
 
-    # Load indexer
+    neo4j_kwargs = _resolve_neo4j_args(args)
     logger.info(f"Loading index from {args.load}")
     indexer = KGRagIndexer.load(
         args.load,
         prefix=args.prefix,
         device=args.device,
         use_gpu_faiss=args.gpu_faiss,
+        neo4j_password=neo4j_kwargs["neo4j_password"],
     )
 
     # Create generator with optional schema for expansion
@@ -452,6 +477,20 @@ Examples:
 
   # Manual node-type filter
   python scripts/index_rag.py --load ./output/rag_primekb --node_type_filter drug,disease --query "What drugs treat diabetes?"
+
+  # --- Neo4j backend ---
+  # Index into Neo4j (requires Neo4j running; set env with: source export_dual_llm.sh)
+  python scripts/index_rag.py --input ./rag/edc/output/tmp --store_type neo4j --output_dir ./output/rag_neo4j
+
+  # Search from Neo4j-backed index
+  python scripts/index_rag.py --load ./output/rag_neo4j --query "Where is Trane located?"
+
+  # Generate with Neo4j backend
+  python scripts/index_rag.py --load ./output/rag_neo4j --generate --query "Where is Trane located?"
+
+  # Explicit Neo4j connection params (override env vars)
+  python scripts/index_rag.py --load ./output/rag_neo4j --store_type neo4j \\
+    --neo4j_uri bolt://localhost:7687 --neo4j_password password123 --query "..."
         """,
     )
 
@@ -540,6 +579,34 @@ Examples:
         "--gpu_faiss",
         action="store_true",
         help="Use GPU for FAISS (requires faiss-gpu)",
+    )
+
+    # Storage backend options
+    parser.add_argument(
+        "--store_type",
+        choices=["faiss", "neo4j"],
+        default="faiss",
+        help="Storage backend: faiss (default) or neo4j",
+    )
+    parser.add_argument(
+        "--neo4j_uri",
+        default=None,
+        help="Neo4j Bolt URI (default: env NEO4J_URI or bolt://localhost:7687)",
+    )
+    parser.add_argument(
+        "--neo4j_user",
+        default=None,
+        help="Neo4j username (default: env NEO4J_USER or neo4j)",
+    )
+    parser.add_argument(
+        "--neo4j_password",
+        default=None,
+        help="Neo4j password (default: env NEO4J_PASSWORD)",
+    )
+    parser.add_argument(
+        "--neo4j_database",
+        default="neo4j",
+        help="Neo4j database name (default: neo4j)",
     )
 
     # Search/Generate options
