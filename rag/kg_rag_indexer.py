@@ -30,7 +30,7 @@ import json
 import logging
 from typing import List, Optional, Dict, Any, Tuple, Union, TYPE_CHECKING
 
-from .triplet_loader import TripletLoader, Triplet
+from .triplet_loader import TripletLoader, Triplet, get_loader
 from .representation import TripletRepresenter, RepresentationMode, EmbeddableItem, get_representer, humanize
 from .embedder import Embedder, get_embedder, DEFAULT_MODEL
 from .faiss_store import FaissStore, SearchResult
@@ -179,19 +179,25 @@ class KGRagIndexer:
         self,
         path: str,
         mode: str = "triplet_text",
+        fmt: str = "auto",
+        node_types: Optional[List[str]] = None,
+        relation_types: Optional[List[str]] = None,
+        max_rows: Optional[int] = None,
         batch_size: int = 32,
         show_progress: bool = True,
         deduplicate: bool = True,
         normalize: bool = True,
     ) -> "KGRagIndexer":
         """
-        Index triplets from EDC pipeline output (canon_kg.txt).
-        
-        Automatically finds the latest canon_kg.txt in the output directory.
+        Index triplets from a data source (EDC canon_kg.txt or PrimeKG kg.csv).
         
         Args:
-            path: Path to canon_kg.txt or EDC output directory
+            path: Path to data file or directory
             mode: Representation mode ("triplet_text" or "entity_context")
+            fmt: Data format -- "auto" (detect), "edc", or "primekb"
+            node_types: PrimeKB only -- filter by node types (e.g. ["drug","disease"])
+            relation_types: PrimeKB only -- filter by relation types
+            max_rows: PrimeKB only -- limit number of CSV rows loaded
             batch_size: Batch size for embedding
             show_progress: Whether to show progress bars
             deduplicate: If True, remove duplicate triplets
@@ -201,13 +207,19 @@ class KGRagIndexer:
             Self for method chaining
         """
         logger.info(f"Starting indexing pipeline for {path}")
-        logger.info(f"Using mode: {mode}")
+        logger.info(f"Using mode: {mode}, format: {fmt}")
         
         self.representation_mode = mode
         
-        # Step 1: Load triplets from canon_kg.txt
-        logger.info("Step 1: Loading triplets from canon_kg.txt...")
-        loader = TripletLoader(path)
+        # Step 1: Load triplets using the appropriate loader
+        logger.info("Step 1: Loading triplets...")
+        loader = get_loader(
+            path,
+            fmt=fmt,
+            node_types=node_types,
+            relation_types=relation_types,
+            max_rows=max_rows,
+        )
         loader.load()
         self.triplets = loader.parse(deduplicate=deduplicate, normalize=normalize)
         logger.info(f"Loaded {len(self.triplets)} unique triplets")

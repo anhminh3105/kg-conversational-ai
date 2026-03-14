@@ -37,9 +37,9 @@ This project implements three approaches for knowledge graph question answering:
 3. **RAG-based Approach** ([`scripts/index_rag.py`](scripts/index_rag.py)): Retrieval-Augmented Generation over KG triplets
 
       ```
-            KG Triplets (canon_kg.txt)
+            KG Triplets (EDC canon_kg.txt or PrimeKG kg.csv)
                   ↓
-            Embed & Index (FAISS)
+            Embed & Index (FAISS / Neo4j)
                   ↓
             Natural Language Question
                   ↓
@@ -143,13 +143,15 @@ rm -rf ~/tools/neo4j-community-5.26.0/data/*
 kg-conversational-ai/
 ├── data/
 │   ├── movie_data.csv              # Sample movie dataset
-│   └── training_data_complete.json # Training examples (with Cypher)
+│   ├── training_data_complete.json # Training examples (with Cypher)
+│   └── kg.csv                      # PrimeKG dataset (download with scripts/download_primekb.py)
 ├── models/                         # Saved models (generated)
 │   ├── intent_classifier.pkl       # ML classifier
 │   └── question_to_cypher/         # Fine-tuned T5 model
 ├── rag/                            # RAG module
 │   ├── __init__.py                 # Module exports
-│   ├── triplet_loader.py           # Step 1: Load triplets
+│   ├── triplet_loader.py           # Step 1: Load EDC triplets + get_loader() factory
+│   ├── primekb_loader.py           # Step 1b: Load PrimeKG triplets from kg.csv
 │   ├── representation.py           # Step 2: Convert to text
 │   ├── embedder.py                 # Step 3: Generate embeddings
 │   ├── faiss_store.py              # Step 4: FAISS vector store
@@ -163,8 +165,11 @@ kg-conversational-ai/
 │       │   ├── kg_qa.txt           # QA prompt template
 │       │   └── triplet_expansion.txt # Expansion prompt template
 │       └── schemas/                # Schema definitions
+│           └── primekb_schema.csv  # PrimeKG relation definitions
 ├── scripts/
-│   ├── import_kg_data_from_json.py # Data import script
+│   ├── import_kg_data_from_json.py # Movie data import script
+│   ├── import_primekb_to_neo4j.py  # PrimeKG -> Neo4j graph import
+│   ├── download_primekb.py         # Download PrimeKG from Harvard Dataverse
 │   ├── nlp_to_cypher.py            # ML-based NLP-to-Cypher
 │   ├── llm_light_train.py          # Transformer training
 │   ├── llm_light_demo.py           # Transformer demo/inference
@@ -175,6 +180,7 @@ kg-conversational-ai/
 ├── export_local_llm.sh             # Local LLM config
 ├── environment.yml                 # Conda environment
 ├── requirements.txt                # pip requirements
+├── CHANGELOG.md                    # Release changelog
 └── README.md
 ```
 
@@ -326,54 +332,46 @@ The expansion uses the schema to constrain generated predicates, ensuring consis
 
 #### Programmatic Usage
 
-```python
-from rag import KGRagIndexer, KGRagGenerator
+See [scripts/PROGRAMMATIC_USAGE.md](scripts/PROGRAMMATIC_USAGE.md) for Python API examples (indexing, search, generation, triplet expansion, and PrimeKG loader).
 
-# Index triplets
-indexer = KGRagIndexer()
-indexer.index_from_path("./rag/edc/output/tmp", mode="triplet_text")
-indexer.save("./output/rag")
+#### PrimeKG Dataset (Biomedical Knowledge Graph)
 
-# Load and search
-indexer = KGRagIndexer.load("./output/rag")
-results = indexer.search("Where is Trane located?", top_k=5)
+The system supports [PrimeKG](https://zitniklab.hms.harvard.edu/projects/PrimeKG/), a precision medicine knowledge graph with ~8.1 million relationships across 10 biological scales (genes, drugs, diseases, pathways, etc.).
 
-# Full RAG with LLM generation
-generator = KGRagGenerator(indexer)
-result = generator.generate("Where is Trane located?")
-print(result.answer)    # "Trane is located in Swords, Dublin."
-print(result.sources)   # [(Trane, location, Swords_Dublin)]
-
-# RAG with triplet expansion (enriches sparse facts)
-result = generator.generate(
-    "Where was Alan Shepard born?",
-    expand_triplets=True,      # Enable LLM expansion
-    max_expansion=10,          # Max triplets to generate
-)
-print(result.answer)
-print(result.sources)           # All triplets (retrieved + expanded)
-print(result.expanded_triplets) # Only the LLM-generated triplets
+**Download PrimeKG:**
+```bash
+python scripts/download_primekb.py              # downloads kg.csv (~580 MB)
+python scripts/download_primekb.py --all         # also drug/disease feature files
 ```
 
-#### TripletExpander (Standalone Usage)
+**Index PrimeKG for RAG:**
+```bash
+# Full dataset (may take a while)
+python scripts/index_rag.py --input ./data/kg.csv --output_dir ./output/rag_primekb
 
-```python
-from rag import TripletExpander
+# Subset: only drug-disease relationships
+python scripts/index_rag.py --input ./data/kg.csv --format primekb \
+  --node_types drug,disease --max_rows 100000 --output_dir ./output/rag_primekb
 
-# Create expander with schema constraints
-expander = TripletExpander(schema_path="./rag/edc/schemas/webnlg_schema.csv")
-
-# Expand sparse triplets
-retrieved = [("Alan_Shepard", "birthPlace", "New_Hampshire")]
-expanded = expander.expand(
-    query="Tell me about Alan Shepard's career",
-    retrieved_triplets=retrieved,
-    max_new_triplets=5,
-)
-# expanded might include:
-# [("Alan_Shepard", "occupation", "Astronaut"),
-#  ("Alan_Shepard", "mission", "Apollo_14"), ...]
+# Then search / generate as usual
+python scripts/index_rag.py --load ./output/rag_primekb --auto_filter --query "What drugs treat diabetes?" --top_k 50
 ```
+
+**Import PrimeKG into Neo4j (native graph):**
+```bash
+python scripts/import_primekb_to_neo4j.py --input ./data/kg.csv
+python scripts/import_primekb_to_neo4j.py --input ./data/kg.csv \
+  --node_types drug,disease --max_rows 50000
+```
+
+**PrimeKG filtering options:**
+
+| Option | CLI flag | Description |
+|--------|----------|-------------|
+| Node types | `--node_types` | Comma-separated list (e.g. `drug,disease,gene/protein`) |
+| Relation types | `--relation_types` | Comma-separated list (e.g. `treats,associates`) |
+| Row limit | `--max_rows` | Cap CSV rows loaded (useful for quick experiments) |
+| Format | `--format primekb` | Force PrimeKG format (auto-detected for `.csv` files) |
 
 ### 4. Visualize Knowledge Graph
 

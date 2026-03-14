@@ -246,6 +246,55 @@ class TripletLoader:
         return loader
 
 
+def get_loader(
+    path: str,
+    fmt: str = "auto",
+    node_types: Optional[List[str]] = None,
+    relation_types: Optional[List[str]] = None,
+    max_rows: Optional[int] = None,
+):
+    """
+    Factory that returns the right loader for the given data format.
+
+    Args:
+        path: Path to data file or directory
+        fmt: ``"auto"`` detects by extension, ``"edc"`` for canon_kg.txt,
+             ``"primekb"`` for PrimeKG kg.csv
+        node_types: PrimeKB-only -- keep rows matching these node types
+        relation_types: PrimeKB-only -- keep rows matching these relation types
+        max_rows: PrimeKB-only -- cap the number of CSV rows loaded
+
+    Returns:
+        A ``TripletLoader`` or ``PrimeKBLoader`` instance (already constructed,
+        but *not* yet loaded -- call ``.load().parse()`` on the result).
+    """
+    fmt = fmt.lower().strip()
+
+    if fmt == "auto":
+        p = Path(path)
+        if p.is_file() and p.suffix.lower() == ".csv":
+            fmt = "primekb"
+        elif p.is_dir():
+            kg_csv = p / "kg.csv"
+            fmt = "primekb" if kg_csv.exists() else "edc"
+        else:
+            fmt = "edc"
+
+    if fmt == "primekb":
+        from .primekb_loader import PrimeKBLoader
+        return PrimeKBLoader(
+            path,
+            node_types=node_types,
+            relation_types=relation_types,
+            max_rows=max_rows,
+        )
+
+    if fmt == "edc":
+        return TripletLoader(path)
+
+    raise ValueError(f"Unknown format '{fmt}'. Use 'auto', 'edc', or 'primekb'.")
+
+
 if __name__ == "__main__":
     import sys
     

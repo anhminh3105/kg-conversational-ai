@@ -2,7 +2,9 @@
 RAG (Retrieval-Augmented Generation) module for Knowledge Graph triplets.
 
 This module provides functionality to:
-1. Load and parse KG triplets from EDC pipeline output (canon_kg.txt)
+1. Load and parse KG triplets from multiple sources:
+   - EDC pipeline output (canon_kg.txt)
+   - PrimeKG biomedical knowledge graph (kg.csv)
 2. Convert triplets to embeddable text representations
 3. Generate embeddings using sentence-transformers
 4. Store and retrieve from FAISS index or Neo4j database
@@ -22,13 +24,19 @@ Usage:
     indexer.index_from_path("./output/tmp", mode="triplet_text")
     indexer.save("./output/rag")
     
-    # Index with Neo4j backend
-    indexer = KGRagIndexer(
-        store_type="neo4j",
-        neo4j_uri="bolt://localhost:7687",
-        neo4j_password="password123",
+    # Index from PrimeKG (auto-detected from .csv extension)
+    indexer = KGRagIndexer()
+    indexer.index_from_path("./data/kg.csv", mode="triplet_text")
+    indexer.save("./output/rag_primekb")
+    
+    # Index PrimeKG with filters
+    indexer = KGRagIndexer()
+    indexer.index_from_path(
+        "./data/kg.csv",
+        fmt="primekb",
+        node_types=["drug", "disease"],
+        max_rows=100000,
     )
-    indexer.index_from_path("./output/tmp", mode="triplet_text")
     
     # Search only
     indexer = KGRagIndexer.load("./output/rag")
@@ -51,7 +59,8 @@ Usage:
     print(result.answer)
 """
 
-from .triplet_loader import TripletLoader, Triplet
+from .triplet_loader import TripletLoader, Triplet, get_loader
+from .primekb_loader import PrimeKBLoader
 from .representation import TripletRepresenter, RepresentationMode, EmbeddableItem, get_representer
 from .embedder import Embedder, get_embedder
 from .faiss_store import FaissStore, SearchResult
@@ -105,6 +114,8 @@ __all__ = [
     # Data loading
     "TripletLoader",
     "Triplet",
+    "get_loader",
+    "PrimeKBLoader",
     
     # Representation
     "TripletRepresenter",

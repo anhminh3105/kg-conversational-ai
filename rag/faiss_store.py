@@ -106,7 +106,7 @@ class FaissStore:
         for item in items:
             self.metadata.append(item.metadata)
         
-        logger.info(f"Added {len(embeddings)} vectors. Total: {self.cacntotal}")
+        logger.info(f"Added {len(embeddings)} vectors. Total: {self.index.ntotal}")
     
     def search(
         self,

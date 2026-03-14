@@ -65,10 +65,24 @@ def index_mode(args: argparse.Namespace) -> None:
         use_gpu_faiss=args.gpu_faiss,
     )
 
+    # Parse comma-separated filter lists
+    node_types = (
+        [t.strip() for t in args.node_types.split(",") if t.strip()]
+        if args.node_types else None
+    )
+    relation_types = (
+        [r.strip() for r in args.relation_types.split(",") if r.strip()]
+        if args.relation_types else None
+    )
+
     # Run indexing
     indexer.index_from_path(
         path=args.input,
         mode=args.mode,
+        fmt=args.format,
+        node_types=node_types,
+        relation_types=relation_types,
+        max_rows=args.max_rows,
         batch_size=args.batch_size,
         show_progress=True,
         deduplicate=not args.no_deduplicate,
@@ -338,6 +352,13 @@ Examples:
   # Index EDC output (from canon_kg.txt)
   python scripts/index_rag.py --input ./rag/edc/output/tmp --output_dir ./output/rag
 
+  # Index PrimeKG dataset (auto-detected from .csv extension)
+  python scripts/index_rag.py --input ./data/kg.csv --output_dir ./output/rag_primekb
+
+  # Index PrimeKG with filters (only drug-disease relationships, first 100k rows)
+  python scripts/index_rag.py --input ./data/kg.csv --format primekb \\
+    --node_types drug,disease --relation_types treats,associates --max_rows 100000
+
   # Search only (retrieve triplets without LLM)
   python scripts/index_rag.py --load ./output/rag --query "Where is Trane located?"
 
@@ -369,7 +390,7 @@ Examples:
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--input",
-        help="Path to EDC output directory or canon_kg.txt (indexing mode)",
+        help="Path to data file/directory for indexing (EDC output dir, canon_kg.txt, or PrimeKG kg.csv)",
     )
     mode_group.add_argument(
         "--load",
@@ -408,6 +429,30 @@ Examples:
         "--no_normalize",
         action="store_true",
         help="Disable entity name normalization (default: enabled)",
+    )
+
+    # Data format options
+    parser.add_argument(
+        "--format",
+        choices=["auto", "edc", "primekb"],
+        default="auto",
+        help="Input data format (default: auto-detect by file extension)",
+    )
+    parser.add_argument(
+        "--node_types",
+        default=None,
+        help="PrimeKB: comma-separated node types to keep (e.g. drug,disease)",
+    )
+    parser.add_argument(
+        "--relation_types",
+        default=None,
+        help="PrimeKB: comma-separated relation types to keep (e.g. treats,associates)",
+    )
+    parser.add_argument(
+        "--max_rows",
+        type=int,
+        default=None,
+        help="PrimeKB: maximum CSV rows to load (useful for large datasets)",
     )
 
     # Model options
