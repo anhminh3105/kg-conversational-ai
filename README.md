@@ -172,6 +172,7 @@ kg-conversational-ai/
 ├── scripts/
 │   ├── import_kg_data_from_json.py # Movie data import script
 │   ├── import_primekb_to_neo4j.py  # PrimeKG -> Neo4j graph import
+│   ├── convert_primekb_to_triplets.py # Bridge: native PrimeKG -> :Triplet nodes
 │   ├── download_primekb.py         # Download PrimeKG from Harvard Dataverse
 │   ├── nlp_to_cypher.py            # ML-based NLP-to-Cypher
 │   ├── llm_light_train.py          # Transformer training
@@ -179,7 +180,9 @@ kg-conversational-ai/
 │   ├── index_rag.py                # RAG CLI script
 │   ├── demo_mcp_agent.py           # MCP Agent batch demo
 │   ├── interactive_agent.py        # MCP Agent interactive REPL
-│   └── visulize_graph.py           # Graph visualization
+│   ├── migrate_faiss_to_neo4j.py   # Migrate FAISS index → Neo4j
+│   ├── visualize_kg.py             # KG visualization (Triplet + PrimeKG schemas)
+│   └── visulize_graph.py           # Graph visualization (movie data)
 ├── export_google_ai.sh             # Google AI Studio config
 ├── export_sambanova.sh             # SambaNova config
 ├── export_local_llm.sh             # Local LLM config
@@ -370,6 +373,24 @@ python scripts/import_primekb_to_neo4j.py --input ./data/kg.csv \
   --node_types drug,disease --max_rows 50000
 ```
 
+**Bridge native PrimeKG graph to demo scripts:**
+
+The native Neo4j import creates typed nodes (`:Drug`, `:Disease`) with typed
+relationships, which is a different schema from the `:Triplet` nodes the demo
+scripts expect. Use the bridge script to convert:
+
+```bash
+# After import_primekb_to_neo4j.py, convert for demo compatibility
+python scripts/convert_primekb_to_triplets.py
+
+# Filter by node types or limit rows
+python scripts/convert_primekb_to_triplets.py --node-types drug,disease --max-rows 50000
+
+# Now demos work with PrimeKB data
+python scripts/demo_mcp_agent.py --simple
+python scripts/interactive_agent.py --lite
+```
+
 **PrimeKG filtering options:**
 
 | Option | CLI flag | Description |
@@ -379,8 +400,69 @@ python scripts/import_primekb_to_neo4j.py --input ./data/kg.csv \
 | Row limit | `--max_rows` | Cap CSV rows loaded (useful for quick experiments) |
 | Format | `--format primekb` | Force PrimeKG format (auto-detected for `.csv` files) |
 
+### Migrate FAISS Index to Neo4j ([`scripts/migrate_faiss_to_neo4j.py`](scripts/migrate_faiss_to_neo4j.py))
+
+After indexing triplets into a FAISS vector store (Step 1 above), use the migration script to transfer the embeddings and triplet metadata into Neo4j. This enables graph traversal, Cypher queries, and the MCP Agent workflows alongside vector similarity search.
+
+**Migrate EDC / WebNLG triplets:**
+
+The EDC pipeline produces `canon_kg.txt` in `rag/edc/output_webnlg/iter2`. After indexing those triplets into FAISS, migrate them to Neo4j:
+
+```bash
+# 1. Index EDC triplets into FAISS (if not already done)
+python scripts/index_rag.py --input ./rag/edc/output_webnlg/iter2 --output_dir ./output/rag
+
+# 2. Migrate to Neo4j
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag
+
+# 3. Clear existing data first, then migrate
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag --clear
+
+# 4. Verify migration (compares FAISS and Neo4j counts + sample queries)
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag --verify
+```
+
+**Migrate PrimeKG triplets:**
+
+For the biomedical PrimeKG dataset, first index into FAISS then migrate:
+
+```bash
+# 1. Index PrimeKG into FAISS (full or filtered)
+python scripts/index_rag.py --input ./data/kg.csv --output_dir ./output/rag_primekb
+python scripts/index_rag.py --input ./data/kg.csv --format primekb \
+    --node_types drug,disease --max_rows 100000 --output_dir ./output/rag_primekb
+
+# 2. Migrate to Neo4j (clear to avoid mixing with WebNLG data)
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb --clear
+
+# 3. Re-embed during migration (useful if switching embedding models)
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb \
+    --re-embed --embedding-model BAAI/bge-small-en-v1.5
+
+# 4. Dry run to preview without writing
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb --dry-run
+```
+
+**Migration CLI options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--faiss-dir` | *(required)* | Directory containing FAISS index files (`kg_triplets.faiss`, `kg_triplets_meta.json`) |
+| `--prefix` | `kg_triplets` | FAISS file prefix |
+| `--neo4j-uri` | `bolt://localhost:7687` | Neo4j Bolt URI |
+| `--neo4j-user` | `neo4j` | Neo4j username |
+| `--neo4j-password` | env `NEO4J_PASSWORD` or `password123` | Neo4j password |
+| `--neo4j-database` | `neo4j` | Neo4j database name |
+| `--batch-size` | `100` | Triplets per batch |
+| `--re-embed` | disabled | Re-generate embeddings during migration |
+| `--embedding-model` | env `LOCAL_EMBEDDER_MODEL` or `BAAI/bge-small-en-v1.5` | Model for `--re-embed` |
+| `--clear` | disabled | Delete existing `:Triplet` nodes before migrating |
+| `--verify` | disabled | Compare FAISS and Neo4j counts after migration |
+| `--dry-run` | disabled | Show stats and sample triplets without writing |
+
 ### 4. Visualize Knowledge Graph
 
+**Movie data visualization:**
 ```bash
 python scripts/visulize_graph.py
 ```
@@ -390,6 +472,18 @@ Generates visualization files in `outputs/`:
 - `knowledge_graph_drama.png` - Drama movies subgraph
 - `knowledge_graph_sci-fi.png` - Sci-Fi movies subgraph
 - `knowledge_graph_action.png` - Action movies subgraph
+
+**KG triplet / PrimeKG visualization:**
+```bash
+# Auto-detect schema (Triplet or PrimeKG)
+python scripts/visualize_kg.py --output outputs/kg_full.png
+
+# Visualize native PrimeKG graph
+python scripts/visualize_kg.py --schema primekb --output outputs/primekb_graph.png
+
+# Visualize PrimeKG entity subgraph
+python scripts/visualize_kg.py --schema primekb --entity "aspirin" --depth 2
+```
 
 ### 5. MCP Agent -- Agentic Knowledge Graph Q&A
 
@@ -404,7 +498,12 @@ All MCP Agent workflows require Neo4j with indexed data:
 ```bash
 # Ensure Neo4j is running (see Neo4j Setup above)
 # Migrate FAISS index into Neo4j (one-time)
-python scripts/migrate_faiss_to_neo4j.py --input ./output/rag
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag
+
+# Or use PrimeKG data instead:
+python scripts/index_rag.py --input ./data/kg.csv --format primekb \
+    --node_types drug,disease --output_dir ./output/rag_primekb
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb
 
 # Configure an LLM provider
 source export_sambanova.sh    # or export_google_ai.sh, export_local_llm.sh

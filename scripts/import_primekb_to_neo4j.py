@@ -231,6 +231,16 @@ def main():
         print("\n" + "=" * 60)
         print("Import complete!")
         print("=" * 60)
+        print("\nNext steps with native PrimeKG graph:")
+        print("  # Convert to :Triplet nodes for demo scripts:")
+        print("  python scripts/convert_primekb_to_triplets.py")
+        print("")
+        print("  # Then run demos:")
+        print("  python scripts/demo_mcp_agent.py --simple")
+        print("  python scripts/interactive_agent.py --lite")
+        print("")
+        print("  # Or visualize the native graph directly:")
+        print("  python scripts/visualize_kg.py --schema primekb")
     finally:
         conn.close()
 

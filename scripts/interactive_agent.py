@@ -12,7 +12,9 @@ Supports dual-LLM mode for validated knowledge expansion:
 
 Prerequisites:
 - Neo4j running at bolt://localhost:7687
-- Knowledge graph data loaded (run migrate_faiss_to_neo4j.py first)
+- Knowledge graph data loaded via one of:
+    Path A (RAG pipeline): index_rag.py + migrate_faiss_to_neo4j.py
+    Path B (PrimeKB native): import_primekb_to_neo4j.py + convert_primekb_to_triplets.py
 - For full mode: GPU with ~6GB VRAM for Qwen2.5-7B with 4-bit quantization
 - For lite mode: API backend configured (export_google_ai.sh or similar)
 - For validation mode: Remote LLM configured (export_dual_llm.sh)
@@ -79,6 +81,32 @@ logging.basicConfig(
     format='%(levelname)s: %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+PRIMEKB_PREDICATES = {
+    "treats", "associated_with", "interacts_with", "contraindicates",
+    "side_effect", "indication", "off-label_use", "synergistic_interaction",
+    "presents", "phenotype_absent", "phenotype_present",
+}
+
+
+def _detect_primekb_data(driver) -> bool:
+    """Check whether :Triplet nodes contain PrimeKB biomedical predicates."""
+    try:
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (t:Triplet) "
+                "WITH t.predicate AS p LIMIT 500 "
+                "WITH collect(DISTINCT toLower(p)) AS preds "
+                "RETURN preds"
+            )
+            record = result.single()
+            if not record:
+                return False
+            preds = set(record["preds"])
+            return bool(preds & PRIMEKB_PREDICATES)
+    except Exception:
+        return False
 
 
 # ANSI color codes
@@ -501,6 +529,11 @@ def run_interactive_session(
     print_colored("  Agent ready!", Colors.GREEN)
     print(f"  Knowledge Graph: {neo4j_store.size} triplets")
     
+    # Detect PrimeKB data
+    is_primekb = _detect_primekb_data(neo4j_store.driver)
+    if is_primekb:
+        print_colored("  Dataset: PrimeKB biomedical", Colors.GREEN)
+    
     if validation_mode:
         print_colored(f"  Validation Mode: ENABLED (Local: {llm_model.split('/')[-1]} ↔ Remote: {remote_model})", Colors.GREEN)
     
@@ -508,6 +541,20 @@ def run_interactive_session(
     verbose_mode = start_verbose
     expand_mode = enable_expansion
     query_history = []
+    
+    # Build tips section with optional PrimeKB examples
+    tips_section = f"""{Colors.BOLD}Tips:{Colors.RESET}
+  - Use arrow keys to navigate command history
+  - Press Ctrl+C to cancel current operation
+  - Press Ctrl+D or type /quit to exit"""
+    if is_primekb:
+        tips_section += f"""
+
+{Colors.BOLD}PrimeKB Example Queries:{Colors.RESET}
+  - What drugs treat diabetes?
+  - What are the side effects of aspirin?
+  - What genes are associated with Alzheimer's disease?
+  - Which diseases are linked to gene TP53?"""
     
     # Help text
     help_text = f"""
@@ -534,10 +581,7 @@ def run_interactive_session(
   
   Use /verbose to see detailed interaction between the LLMs.
   
-{Colors.BOLD}Tips:{Colors.RESET}
-  - Use arrow keys to navigate command history
-  - Press Ctrl+C to cancel current operation
-  - Press Ctrl+D or type /quit to exit
+{tips_section}
 """
     
     print(help_text)

@@ -12,7 +12,9 @@ This script demonstrates the full pipeline:
 
 Prerequisites:
 - Neo4j running at bolt://localhost:7687
-- Knowledge graph data loaded (run migrate_faiss_to_neo4j.py first)
+- Knowledge graph data loaded via one of:
+    Path A (RAG pipeline): index_rag.py + migrate_faiss_to_neo4j.py
+    Path B (PrimeKB native): import_primekb_to_neo4j.py + convert_primekb_to_triplets.py
 - GPU with ~6GB VRAM for Qwen2.5-7B with 4-bit quantization
 
 Usage:
@@ -65,6 +67,32 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+PRIMEKB_PREDICATES = {
+    "treats", "associated_with", "interacts_with", "contraindicates",
+    "side_effect", "indication", "off-label_use", "synergistic_interaction",
+    "presents", "phenotype_absent", "phenotype_present",
+}
+
+
+def _detect_primekb_data(driver) -> bool:
+    """Check whether :Triplet nodes contain PrimeKB biomedical predicates."""
+    try:
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (t:Triplet) "
+                "WITH t.predicate AS p LIMIT 500 "
+                "WITH collect(DISTINCT toLower(p)) AS preds "
+                "RETURN preds"
+            )
+            record = result.single()
+            if not record:
+                return False
+            preds = set(record["preds"])
+            return bool(preds & PRIMEKB_PREDICATES)
+    except Exception:
+        return False
 
 
 def test_neo4j_connection(uri: str, user: str, password: str) -> bool:
@@ -162,12 +190,26 @@ def run_mcp_agent_demo(
     
     print("  Agent created successfully!")
     
-    # Demo queries
+    # Demo queries -- detect PrimeKB biomedical data and pick appropriate set
     demo_queries = [
         "What is in the knowledge graph?",
         "Tell me about the main entities in the database.",
         "What relationships exist between entities?",
     ]
+    primekb_queries = [
+        "What drugs treat diabetes?",
+        "What are the side effects of aspirin?",
+        "What genes are associated with Alzheimer's disease?",
+    ]
+    
+    neo4j_driver = (
+        agent.neo4j_store.driver
+        if hasattr(agent, "neo4j_store")
+        else None
+    )
+    if neo4j_driver and _detect_primekb_data(neo4j_driver):
+        print("\n  \033[1;32mDetected PrimeKB biomedical data — using domain queries\033[0m")
+        demo_queries = primekb_queries
     
     print("\n" + "=" * 60)
     print("Step 3: Running Demo Queries")

@@ -166,10 +166,16 @@ def main():
 
     print("\n" + "=" * 60)
     print("Done! Next steps:")
-    print(f"  # Index for RAG:")
-    print(f"  python scripts/index_rag.py --input {kg_path} --output_dir ./output/rag_primekb")
-    print(f"\n  # Import into Neo4j:")
-    print(f"  python scripts/import_primekb_to_neo4j.py --input {kg_path}")
+    print(f"\n  Path A — For use with demo scripts (RAG pipeline):")
+    print(f"    python scripts/index_rag.py --input {kg_path} --format primekb \\")
+    print(f"        --node_types drug,disease --output_dir ./output/rag_primekb")
+    print(f"    python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb")
+    print(f"    python scripts/demo_mcp_agent.py              # run demo")
+    print(f"    python scripts/interactive_agent.py            # interactive chat")
+    print(f"\n  Path B — For native graph exploration:")
+    print(f"    python scripts/import_primekb_to_neo4j.py --input {kg_path}")
+    print(f"    python scripts/convert_primekb_to_triplets.py  # bridge to :Triplet nodes")
+    print(f"    python scripts/visualize_kg.py --schema primekb")
     print("=" * 60)
 
 
