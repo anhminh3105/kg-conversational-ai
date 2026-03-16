@@ -36,6 +36,15 @@ Usage:
     
     # Start with verbose mode enabled
     python scripts/interactive_agent.py --verbose
+    
+    # Run simple search demo (no LLM required) then exit
+    python scripts/interactive_agent.py --simple
+    
+    # Run triplet expansion demo then enter interactive session
+    python scripts/interactive_agent.py --expand
+    
+    # Run triplet expansion demo and persist to Neo4j
+    python scripts/interactive_agent.py --expand --persist
 
 Interactive Commands:
     /help              - Show available commands
@@ -50,6 +59,8 @@ Interactive Commands:
     /search <query>    - Direct semantic search (no agent reasoning)
     /entity <name>     - Query all facts about an entity
     /cypher <query>    - Execute raw Cypher query
+    /search-demo       - Run simple search demo (no LLM required)
+    /expand-demo       - Run triplet expansion demo (add --persist to save)
 """
 
 import argparse
@@ -270,6 +281,117 @@ def test_neo4j_connection(uri: str, user: str, password: str) -> bool:
         return False
 
 
+def run_simple_search_demo(neo4j_store, embedder, handler):
+    """
+    Run a simple search demo without loading the full LLM.
+
+    Demonstrates MCP tool usage (search, tool listing) using only the
+    embedder for semantic search -- no LLM required.
+    """
+    print_section("Simple Search Demo (No LLM Required)", Colors.BOLD)
+
+    print(f"\n  {Colors.CYAN}Connected to Neo4j:{Colors.RESET} {neo4j_store.size} triplets")
+
+    print_colored("\n  Available MCP Tools:", Colors.YELLOW)
+    for tool in handler.get_tools():
+        name = tool['function']['name']
+        desc = tool['function']['description'][:60]
+        print(f"    {Colors.BOLD}{name}{Colors.RESET}")
+        print(f"      {desc}...")
+
+    print_section("Testing search_knowledge_graph", Colors.YELLOW)
+    search_query = "Tell me about the entities"
+    print(f"  Query: '{search_query}'")
+
+    result = handler.handle_tool_call(
+        "search_knowledge_graph",
+        {"query": search_query, "top_k": 5}
+    )
+    data = json.loads(result)
+    print(f"\n  Found {data.get('num_results', 0)} results:")
+    for fact in data.get('facts', [])[:5]:
+        score = fact.get('score', 0)
+        f = fact.get('fact', '')
+        print(f"    [{score:.3f}] {f}")
+
+    print_colored("\n  Simple Search Demo Complete!", Colors.GREEN)
+
+
+def run_triplet_expansion_demo(neo4j_store, embedder, handler, persist: bool = False):
+    """
+    Demonstrate triplet expansion with MCP tools.
+
+    Shows how the LLM can generate additional knowledge graph triplets
+    based on existing facts and a user query.
+    """
+    print_section("Triplet Expansion Demo", Colors.BOLD)
+
+    print(f"\n  {Colors.CYAN}Neo4j connected:{Colors.RESET} {neo4j_store.size} triplets")
+    print(f"  {Colors.CYAN}Triplet expansion:{Colors.RESET} {'enabled' if handler.enable_expansion else 'disabled'}")
+
+    print_section("[1] Searching knowledge graph for relevant facts", Colors.YELLOW)
+    search_query = "Tell me about the main topic"
+    result = handler.handle_tool_call(
+        "search_knowledge_graph",
+        {"query": search_query, "top_k": 5}
+    )
+    search_data = json.loads(result)
+
+    existing_facts = []
+    print(f"\n  Found {search_data.get('num_results', 0)} existing facts:")
+    for fact in search_data.get('facts', []):
+        print(f"    [{fact.get('score', 0):.3f}] {fact.get('fact', '')}")
+        existing_facts.append(fact.get('fact', ''))
+
+    if not existing_facts:
+        print_colored("\n  No existing facts found. Using sample facts for demo...", Colors.YELLOW)
+        existing_facts = [
+            "(Einstein, born_in, Germany)",
+            "(Einstein, field, Physics)",
+            "(Einstein, known_for, Relativity)",
+        ]
+        print("  Sample facts:")
+        for f in existing_facts:
+            print(f"    {f}")
+
+    print_section("[2] Expanding triplets using LLM", Colors.YELLOW)
+    expansion_query = "What else do we know about this topic and related facts?"
+
+    expand_result = handler.handle_tool_call(
+        "expand_triplets",
+        {
+            "query": expansion_query,
+            "existing_facts": existing_facts,
+            "max_new_triplets": 5,
+            "persist_to_graph": persist,
+        }
+    )
+    expand_data = json.loads(expand_result)
+
+    if "error" in expand_data:
+        print_colored(f"\n  Error: {expand_data['error']}", Colors.RED)
+    else:
+        print(f"\n  {Colors.CYAN}Existing facts used:{Colors.RESET} {expand_data.get('existing_facts_count', 0)}")
+        print(f"  {Colors.CYAN}New facts generated:{Colors.RESET} {expand_data.get('expanded_facts_count', 0)}")
+
+        if expand_data.get('expanded_facts'):
+            print_colored("\n  Generated triplets:", Colors.GREEN)
+            for fact in expand_data['expanded_facts']:
+                print(f"    {Colors.GREEN}+{Colors.RESET} {fact.get('fact', '')}")
+                print(f"      {Colors.GRAY}(source: {fact.get('source', 'unknown')}){Colors.RESET}")
+
+        if persist and expand_data.get('persisted_count', 0) > 0:
+            print_colored(f"\n  Persisted {expand_data['persisted_count']} triplets to Neo4j!", Colors.GREEN)
+            print(f"  New total: {neo4j_store.size} triplets")
+
+    print_section("[3] How expansion helps answer questions", Colors.YELLOW)
+    print(f"  {Colors.GRAY}Without expansion: Only the original retrieved facts are available{Colors.RESET}")
+    print(f"  {Colors.GRAY}With expansion: LLM generates additional relevant facts that can{Colors.RESET}")
+    print(f"  {Colors.GRAY}                fill gaps in the knowledge graph and improve answers{Colors.RESET}")
+
+    print_colored("\n  Triplet Expansion Demo Complete!", Colors.GREEN)
+
+
 def run_interactive_session(
     neo4j_uri: str,
     neo4j_user: str,
@@ -402,6 +524,8 @@ def run_interactive_session(
   /search <query>    - Direct semantic search (no agent reasoning)
   /entity <name>     - Query all facts about an entity
   /cypher <query>    - Execute raw Cypher query
+  /search-demo       - Run simple search demo (no LLM required)
+  /expand-demo       - Run triplet expansion demo (add --persist to save)
 
 {Colors.BOLD}Dual-LLM Validation:{Colors.RESET}
   When validation mode is ON, the agent uses two LLMs:
@@ -572,6 +696,16 @@ def run_interactive_session(
                             for r in data.get('results', [])[:10]:
                                 print(f"    {r}")
                 
+                elif cmd == "/search-demo":
+                    run_simple_search_demo(neo4j_store, embedder, handler)
+
+                elif cmd == "/expand-demo":
+                    persist_flag = "--persist" in cmd_arg
+                    if not handler.enable_expansion:
+                        print_colored("\n  Triplet expansion is currently disabled.", Colors.YELLOW)
+                        print("  Use /expand to enable it first, or pass --persist to this command.")
+                    run_triplet_expansion_demo(neo4j_store, embedder, handler, persist=persist_flag)
+
                 else:
                     print(f"  Unknown command: {cmd}")
                     print("  Type /help for available commands")
@@ -675,6 +809,9 @@ Examples:
   python scripts/interactive_agent.py --validate         # Enable dual-LLM validation
   python scripts/interactive_agent.py --validate -v      # Validation + verbose output
   python scripts/interactive_agent.py --neo4j-password pass123
+  python scripts/interactive_agent.py --simple           # Simple search demo (no LLM)
+  python scripts/interactive_agent.py --expand           # Triplet expansion demo
+  python scripts/interactive_agent.py --expand --persist # Expansion + persist to Neo4j
 
 Dual-LLM Validation Mode:
   To use validation mode, first configure the remote LLM:
@@ -720,6 +857,21 @@ Dual-LLM Validation Mode:
         action="store_true",
         help="Enable dual-LLM validation mode (requires remote LLM config)"
     )
+    parser.add_argument(
+        "--simple",
+        action="store_true",
+        help="Run simple search demo (no LLM required) then exit"
+    )
+    parser.add_argument(
+        "--expand",
+        action="store_true",
+        help="Run triplet expansion demo then enter interactive session"
+    )
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="Persist expanded triplets to Neo4j (use with --expand)"
+    )
     
     args = parser.parse_args()
     
@@ -734,6 +886,36 @@ Dual-LLM Validation Mode:
         print("\nCannot proceed without Neo4j connection.")
         print("Please ensure Neo4j is running and try again.")
         sys.exit(1)
+    
+    # Handle one-shot demo modes (--simple, --expand)
+    if args.simple or args.expand:
+        from rag.neo4j_store import Neo4jStore
+        from rag.embedder import get_embedder
+        from rag.mcp_neo4j_server import Neo4jMCPToolHandler
+
+        embedder_model = os.environ.get("LOCAL_EMBEDDER_MODEL", "BAAI/bge-small-en-v1.5")
+        neo4j_store = Neo4jStore(
+            uri=args.neo4j_uri,
+            user=args.neo4j_user,
+            password=neo4j_password,
+        )
+        embedder = get_embedder(model_name=embedder_model)
+        handler = Neo4jMCPToolHandler(
+            neo4j_store,
+            embedder,
+            enable_expansion=True,
+            allow_cypher=True,
+        )
+
+        if args.simple:
+            run_simple_search_demo(neo4j_store, embedder, handler)
+            neo4j_store.close()
+            return
+
+        if args.expand:
+            run_triplet_expansion_demo(neo4j_store, embedder, handler, persist=args.persist)
+            neo4j_store.close()
+            return
     
     # Run interactive session
     run_interactive_session(

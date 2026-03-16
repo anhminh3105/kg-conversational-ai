@@ -155,11 +155,14 @@ kg-conversational-ai/
 │   ├── representation.py           # Step 2: Convert to text
 │   ├── embedder.py                 # Step 3: Generate embeddings
 │   ├── faiss_store.py              # Step 4: FAISS vector store
+│   ├── neo4j_store.py              # Step 4b: Neo4j vector store
 │   ├── kg_rag_indexer.py           # Main orchestrator (Steps 1-4)
 │   ├── retriever.py                # Step 5: Retrieval interface
 │   ├── triplet_expander.py         # Step 5.5: LLM triplet expansion
 │   ├── prompt_builder.py           # Step 6: Prompt augmentation
 │   ├── generator.py                # Step 7: LLM generation
+│   ├── mcp_neo4j_server.py         # MCP tool handler for Neo4j KG
+│   ├── mcp_agent.py                # MCP Agent (agentic KG Q&A)
 │   └── edc/                        # EDC pipeline
 │       ├── prompt_templates/       # All prompt templates
 │       │   ├── kg_qa.txt           # QA prompt template
@@ -174,10 +177,13 @@ kg-conversational-ai/
 │   ├── llm_light_train.py          # Transformer training
 │   ├── llm_light_demo.py           # Transformer demo/inference
 │   ├── index_rag.py                # RAG CLI script
+│   ├── demo_mcp_agent.py           # MCP Agent batch demo
+│   ├── interactive_agent.py        # MCP Agent interactive REPL
 │   └── visulize_graph.py           # Graph visualization
 ├── export_google_ai.sh             # Google AI Studio config
 ├── export_sambanova.sh             # SambaNova config
 ├── export_local_llm.sh             # Local LLM config
+├── export_dual_llm.sh              # Dual-LLM validation config
 ├── environment.yml                 # Conda environment
 ├── requirements.txt                # pip requirements
 ├── CHANGELOG.md                    # Release changelog
@@ -384,6 +390,176 @@ Generates visualization files in `outputs/`:
 - `knowledge_graph_drama.png` - Drama movies subgraph
 - `knowledge_graph_sci-fi.png` - Sci-Fi movies subgraph
 - `knowledge_graph_action.png` - Action movies subgraph
+
+### 5. MCP Agent -- Agentic Knowledge Graph Q&A
+
+The MCP Agent provides tool-augmented LLM reasoning over the Neo4j knowledge graph. The agent decides which MCP tools to call (semantic search, entity lookup, Cypher queries, triplet expansion) to answer questions autonomously.
+
+Two scripts are provided: a **batch demo** for running predefined workflows and an **interactive REPL** for conversational exploration.
+
+#### Prerequisites
+
+All MCP Agent workflows require Neo4j with indexed data:
+
+```bash
+# Ensure Neo4j is running (see Neo4j Setup above)
+# Migrate FAISS index into Neo4j (one-time)
+python scripts/migrate_faiss_to_neo4j.py --input ./output/rag
+
+# Configure an LLM provider
+source export_sambanova.sh    # or export_google_ai.sh, export_local_llm.sh
+```
+
+#### Tutorial A: Batch Demo ([`scripts/demo_mcp_agent.py`](scripts/demo_mcp_agent.py))
+
+Runs predefined demo workflows end-to-end, useful for evaluating the pipeline or showcasing features without interactive input.
+
+**Simple search (no LLM required):**
+```bash
+python scripts/demo_mcp_agent.py --simple
+```
+Lists available MCP tools and runs a sample semantic search against the knowledge graph.
+
+**Full agent demo with predefined queries:**
+```bash
+# Using local GPU
+source export_local_llm.sh
+python scripts/demo_mcp_agent.py
+
+# Using API backend (no GPU needed)
+source export_sambanova.sh
+python scripts/demo_mcp_agent.py --lite
+
+# With tool call traces
+python scripts/demo_mcp_agent.py --lite --verbose
+```
+Connects to Neo4j, creates the MCP Agent, and runs three predefined queries showing tool call traces and final answers.
+
+**Triplet expansion demo:**
+```bash
+# Show LLM-generated triplets (read-only)
+python scripts/demo_mcp_agent.py --expand
+
+# Generate and persist new triplets to Neo4j
+python scripts/demo_mcp_agent.py --expand --persist
+```
+Searches for existing facts, uses the LLM to generate additional related triplets, and optionally persists them to the graph.
+
+**Dual-LLM validated expansion:**
+```bash
+# Configure remote validator LLM first
+source export_dual_llm.sh
+
+# Run validated expansion
+python scripts/demo_mcp_agent.py --validated-expand
+
+# With detailed output
+python scripts/demo_mcp_agent.py --validated-expand --verbose
+
+# Custom query
+python scripts/demo_mcp_agent.py --validated-expand --query "What awards did Einstein win?"
+```
+Full dual-LLM workflow: local LLM proposes triplets, remote LLM validates them, then justified triplets are persisted to Neo4j.
+
+**Demo CLI options:**
+
+| Flag | Description |
+|------|-------------|
+| `--simple` | Simple search demo (no LLM required) |
+| `--lite` | Use API backend instead of local GPU |
+| `--expand` | Triplet expansion demo |
+| `--persist` | Persist expanded triplets (use with `--expand`) |
+| `--validated-expand` | Dual-LLM validated expansion demo |
+| `--verbose`, `-v` | Show tool call details |
+| `--query`, `-q` | Custom query for demos |
+| `--neo4j-password` | Neo4j password (default: env or `password123`) |
+
+#### Tutorial B: Interactive REPL ([`scripts/interactive_agent.py`](scripts/interactive_agent.py))
+
+A conversational interface for exploring the knowledge graph. Ask questions in natural language, toggle features on the fly, and inspect tool calls in real-time.
+
+**Start an interactive session:**
+```bash
+# With API backend (recommended for quick start)
+source export_sambanova.sh
+python scripts/interactive_agent.py --lite
+
+# With local GPU
+source export_local_llm.sh
+python scripts/interactive_agent.py
+
+# With dual-LLM validation enabled from the start
+source export_dual_llm.sh
+python scripts/interactive_agent.py --validate --verbose
+```
+
+**One-shot demo modes (run and exit):**
+```bash
+# Simple search demo (no LLM)
+python scripts/interactive_agent.py --simple
+
+# Triplet expansion demo
+python scripts/interactive_agent.py --expand
+
+# Expansion with persistence
+python scripts/interactive_agent.py --expand --persist
+```
+
+**Interactive commands (inside the REPL):**
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show all available commands |
+| `/quit`, `/exit` | Exit the session |
+| `/tools` | List available MCP tools |
+| `/stats` | Knowledge graph statistics (predicates, entities) |
+| `/verbose` | Toggle verbose mode (tool calls + validation details) |
+| `/validate` | Toggle dual-LLM validation mode |
+| `/expand` | Toggle triplet expansion for agent queries |
+| `/history` | Show recent query history |
+| `/clear` | Clear the terminal screen |
+| `/search <query>` | Direct semantic search (bypasses agent reasoning) |
+| `/entity <name>` | Query all facts about a specific entity |
+| `/cypher <query>` | Execute a raw Cypher query against Neo4j |
+| `/search-demo` | Run the simple search demo |
+| `/expand-demo` | Run triplet expansion demo (add `--persist` to save) |
+
+**Example session:**
+```
+You: What do you know about Einstein?
+Agent: Based on the knowledge graph, Einstein...
+
+You: /verbose
+  Verbose mode: ON
+
+You: Tell me about his work in physics
+Agent: [search_knowledge_graph] → Found 8 facts
+       Einstein is known for the theory of relativity...
+
+You: /entity Einstein
+  Found 12 facts:
+    (Einstein, born_in, Germany)
+    (Einstein, field, Physics)
+    ...
+
+You: /expand-demo
+  [Runs triplet expansion demo using current session]
+
+You: /quit
+```
+
+**Interactive CLI options:**
+
+| Flag | Description |
+|------|-------------|
+| `--lite` | Use API backend instead of local GPU |
+| `--verbose`, `-v` | Start with verbose mode enabled |
+| `--validate` | Enable dual-LLM validation from start |
+| `--no-expansion` | Disable triplet expansion by default |
+| `--simple` | Run simple search demo then exit |
+| `--expand` | Run triplet expansion demo then exit |
+| `--persist` | Persist expanded triplets (use with `--expand`) |
+| `--neo4j-password` | Neo4j password (default: env or `password123`) |
 
 ## 📝 Adding New Training Data
 
