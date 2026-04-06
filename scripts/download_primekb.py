@@ -238,8 +238,9 @@ def main():
     print("Done! Next steps:")
 
     if subset_path:
-        print(f"\n  Path A — Evaluation suite (drug-disease subset):")
+        print(f"\n  Path A — Split + evaluate (drug-disease subset):")
         print(f"    python scripts/eval/split_primekb.py --input {subset_path}")
+        print(f"    python scripts/import_primekb_to_neo4j.py   # imports data/eval/train.csv")
         print(f"    python scripts/eval/generate_qa.py --test-csv data/eval/test.csv")
         print(f"    python scripts/eval/evaluate.py --qa-dataset data/eval/qa_dataset.json")
 
@@ -251,8 +252,7 @@ def main():
     print(f"    python scripts/demo_mcp_agent.py              # run demo")
     print(f"    python scripts/interactive_agent.py            # interactive chat")
     print(f"\n  Path C — Import into Neo4j as :Triplet nodes:")
-    input_file_c = subset_path or kg_path
-    print(f"    python scripts/import_primekb_to_neo4j.py --input {input_file_c}")
+    print(f"    python scripts/import_primekb_to_neo4j.py     # uses data/eval/train.csv")
     print(f"    python scripts/demo_mcp_agent.py              # run demo")
     print(f"    python scripts/interactive_agent.py            # interactive chat")
     print("=" * 60)

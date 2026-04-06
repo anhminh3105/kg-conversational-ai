@@ -6,6 +6,12 @@ Produces a stratified, entity-disjoint split: for each relation type, drugs
 (x_name) are grouped and split so that no drug appears in both train and test
 for the same relation.  This prevents trivial lookup during evaluation.
 
+Outputs (to --output-dir, default data/eval/):
+    train.csv        -- training split, used as default input by
+                        import_primekb_to_neo4j.py to populate Neo4j
+    test.csv         -- held-out test split for evaluation
+    split_stats.json -- per-relation split statistics
+
 Usage:
     python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv
     python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv --test-ratio 0.3

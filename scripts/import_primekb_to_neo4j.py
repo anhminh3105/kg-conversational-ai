@@ -9,8 +9,8 @@ y_type, ...) and writes :Triplet nodes that the RAG pipeline and demo scripts
 Each :Triplet node has: subject, predicate, object, document, source_text,
 embedding (vector), source, and representation_mode properties.
 
-By default, the script reads data/kg_drug_disease.csv (the drug-disease subset
-produced by download_primekb.py).  Pass --input to override.
+By default, the script reads data/eval/train.csv (the train split of the
+drug-disease subset).  Pass --input to override.
 
 Usage:
     # Default: import the drug-disease subset
@@ -81,7 +81,7 @@ logger = logging.getLogger(__name__)
 WRITE_BATCH_SIZE = 500
 EMBED_BATCH_SIZE = 64
 
-DEFAULT_INPUT = os.path.join(project_root, "data", "kg_drug_disease.csv")
+DEFAULT_INPUT = os.path.join(project_root, "data", "eval", "train.csv")
 
 
 def _neo4j_rel_type(display_relation: str) -> str:
@@ -281,7 +281,7 @@ Examples:
     )
     parser.add_argument(
         "--input", default=DEFAULT_INPUT,
-        help="Path to PrimeKG CSV (default: data/kg_drug_disease.csv)",
+        help="Path to PrimeKG CSV (default: data/eval/train.csv)",
     )
     parser.add_argument("--uri", default="bolt://localhost:7687", help="Neo4j Bolt URI")
     parser.add_argument("--user", default="neo4j", help="Neo4j username")
