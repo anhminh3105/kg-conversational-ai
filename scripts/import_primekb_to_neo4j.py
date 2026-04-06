@@ -1,16 +1,39 @@
 #!/usr/bin/env python
 """
-Import PrimeKG dataset into Neo4j as a native graph.
+Import PrimeKG CSV directly into Neo4j as flat :Triplet nodes with embeddings.
 
-Creates nodes with labels derived from x_type/y_type (e.g. :Drug, :Disease,
-:Gene) and relationships from display_relation (e.g. -[:TREATS]->).
+Reads a PrimeKG-format CSV (columns: x_name, display_relation, y_name, x_type,
+y_type, ...) and writes :Triplet nodes that the RAG pipeline and demo scripts
+(demo_mcp_agent.py, interactive_agent.py) expect.
 
-Uses batched UNWIND queries for performance.
+Each :Triplet node has: subject, predicate, object, document, source_text,
+embedding (vector), source, and representation_mode properties.
+
+By default, the script reads data/kg_drug_disease.csv (the drug-disease subset
+produced by download_primekb.py).  Pass --input to override.
 
 Usage:
+    # Default: import the drug-disease subset
+    python scripts/import_primekb_to_neo4j.py
+
+    # Import the full PrimeKG dataset
     python scripts/import_primekb_to_neo4j.py --input data/kg.csv
-    python scripts/import_primekb_to_neo4j.py --input data/kg.csv --max_rows 50000
-    python scripts/import_primekb_to_neo4j.py --input data/kg.csv --node_types drug,disease
+
+    # Limit rows for a quick test
+    python scripts/import_primekb_to_neo4j.py --max-rows 500
+
+    # Filter by relation types
+    python scripts/import_primekb_to_neo4j.py --relation-types contraindication,indication
+
+    # Clear existing Triplet nodes before import
+    python scripts/import_primekb_to_neo4j.py --clear
+
+    # Custom Neo4j credentials
+    python scripts/import_primekb_to_neo4j.py --uri bolt://myhost:7687 --password secret
+
+Prerequisites:
+    - Neo4j running (bolt://localhost:7687 by default)
+    - pip install sentence-transformers neo4j numpy pandas tqdm
 """
 
 import argparse
@@ -21,39 +44,58 @@ import sys
 import time
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
+from neo4j import GraphDatabase
+from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
 
-from scripts.import_kg_data_from_json import Neo4jConnection
+# Load rag.embedder directly to avoid rag/__init__.py pulling in LLM deps.
+# Only rag/__init__ drags in LLM utilities; the embedder chain is standalone.
+import importlib.util as _ilu
+import types as _types
+
+_rag_dir = os.path.join(project_root, "rag")
+
+_rag_pkg = _types.ModuleType("rag")
+_rag_pkg.__path__ = [_rag_dir]
+_rag_pkg.__package__ = "rag"
+sys.modules["rag"] = _rag_pkg
+
+def _load_submodule(name: str, filepath: str):
+    spec = _ilu.spec_from_file_location(name, filepath, submodule_search_locations=[])
+    mod = _ilu.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+_load_submodule("rag.triplet_loader", os.path.join(_rag_dir, "triplet_loader.py"))
+_load_submodule("rag.representation", os.path.join(_rag_dir, "representation.py"))
+_embedder_mod = _load_submodule("rag.embedder", os.path.join(_rag_dir, "embedder.py"))
+get_embedder = _embedder_mod.get_embedder
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 2000
+WRITE_BATCH_SIZE = 500
+EMBED_BATCH_SIZE = 64
 
-
-def _neo4j_label(raw_type: str) -> str:
-    """Convert a PrimeKG type string to a valid Neo4j label.
-
-    Examples:
-        'gene/protein' -> 'GeneProtein'
-        'biological_process' -> 'BiologicalProcess'
-        'effect/phenotype' -> 'EffectPhenotype'
-    """
-    cleaned = re.sub(r"[^a-zA-Z0-9 ]", " ", raw_type)
-    return "".join(w.capitalize() for w in cleaned.split())
+DEFAULT_INPUT = os.path.join(project_root, "data", "kg_drug_disease.csv")
 
 
 def _neo4j_rel_type(display_relation: str) -> str:
-    """Convert a PrimeKG display_relation to a Neo4j relationship type.
+    """Convert a PrimeKG display_relation to an upper-case Neo4j-style name.
 
-    Examples:
-        'treats' -> 'TREATS'
-        'associated with' -> 'ASSOCIATED_WITH'
+    'treats' -> 'TREATS',  'associated with' -> 'ASSOCIATED_WITH'
     """
     cleaned = re.sub(r"[^a-zA-Z0-9 ]", " ", display_relation)
     return "_".join(cleaned.upper().split())
 
+
+# ---------------------------------------------------------------------------
+# CSV loading
+# ---------------------------------------------------------------------------
 
 def load_data(
     path: str,
@@ -61,136 +103,218 @@ def load_data(
     node_types: Optional[List[str]] = None,
     relation_types: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Load and optionally filter the PrimeKG CSV."""
-    logger.info(f"Reading {path} ...")
+    """Load a PrimeKG CSV and optionally filter by node / relation types."""
+    logger.info("Reading %s ...", path)
     df = pd.read_csv(path, nrows=max_rows)
-    logger.info(f"Loaded {len(df)} rows")
+    logger.info("Loaded %d rows", len(df))
 
     if node_types:
         nt = {t.lower().strip() for t in node_types}
         df = df[df["x_type"].str.lower().isin(nt) | df["y_type"].str.lower().isin(nt)]
-        logger.info(f"Filtered to {len(df)} rows by node types {nt}")
+        logger.info("Filtered to %d rows by node types %s", len(df), nt)
 
     if relation_types:
         rt = {r.lower().strip() for r in relation_types}
         df = df[df["display_relation"].str.lower().isin(rt)]
-        logger.info(f"Filtered to {len(df)} rows by relation types {rt}")
+        logger.info("Filtered to %d rows by relation types %s", len(df), rt)
 
     return df
 
 
-def create_indexes(conn: Neo4jConnection, labels: set[str]) -> None:
-    """Create uniqueness constraints / indexes for each node label."""
-    for label in sorted(labels):
-        neo_label = _neo4j_label(label)
+def deduplicate_triplets(df: pd.DataFrame) -> List[dict]:
+    """Extract unique (subject, predicate, object) rows from the DataFrame."""
+    seen: set = set()
+    rows: List[dict] = []
+    for _, r in df.iterrows():
+        subj = str(r["x_name"])
+        pred = _neo4j_rel_type(str(r["display_relation"]))
+        obj = str(r["y_name"])
+        key = (subj, pred, obj)
+        if key not in seen:
+            seen.add(key)
+            rows.append({
+                "subject": subj,
+                "predicate": pred,
+                "object": obj,
+                "subject_type": str(r.get("x_type", "")),
+                "object_type": str(r.get("y_type", "")),
+            })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Neo4j helpers
+# ---------------------------------------------------------------------------
+
+def count_triplet_nodes(driver, database: str = "neo4j") -> int:
+    with driver.session(database=database) as session:
+        result = session.run("MATCH (t:Triplet) RETURN count(t) AS cnt")
+        return result.single()["cnt"]
+
+
+def clear_all_nodes(driver, database: str = "neo4j") -> int:
+    """Delete ALL nodes and relationships in the database in batches."""
+    total = 0
+    while True:
+        with driver.session(database=database) as session:
+            result = session.run(
+                "MATCH (n) WITH n LIMIT 50000 "
+                "DETACH DELETE n RETURN count(*) AS cnt"
+            )
+            batch = result.single()["cnt"]
+        if batch == 0:
+            break
+        total += batch
+    logger.info("Cleared %d nodes from database", total)
+    return total
+
+
+def ensure_triplet_indexes(driver, database: str = "neo4j", embedding_dim: int = 384):
+    """Create constraints and indexes for :Triplet nodes."""
+    with driver.session(database=database) as session:
+        for stmt, desc in [
+            (
+                "CREATE CONSTRAINT triplet_unique IF NOT EXISTS "
+                "FOR (t:Triplet) REQUIRE (t.subject, t.predicate, t.object) IS UNIQUE",
+                "unique constraint",
+            ),
+            (
+                "CREATE INDEX triplet_subject IF NOT EXISTS "
+                "FOR (t:Triplet) ON (t.subject)",
+                "subject index",
+            ),
+            (
+                "CREATE INDEX triplet_object IF NOT EXISTS "
+                "FOR (t:Triplet) ON (t.object)",
+                "object index",
+            ),
+        ]:
+            try:
+                session.run(stmt)
+                logger.info("  Created %s", desc)
+            except Exception as e:
+                logger.debug("  %s: %s", desc, e)
+
         try:
-            conn.query(
-                f"CREATE CONSTRAINT IF NOT EXISTS "
-                f"FOR (n:{neo_label}) REQUIRE n.primekb_id IS UNIQUE"
+            session.run(
+                "CREATE VECTOR INDEX triplet_embedding IF NOT EXISTS "
+                "FOR (t:Triplet) ON t.embedding "
+                "OPTIONS {indexConfig: {"
+                f"`vector.dimensions`: {embedding_dim}, "
+                "`vector.similarity_function`: 'cosine'"
+                "}}"
             )
-            logger.info(f"  Index on :{neo_label}(primekb_id)")
+            logger.info("  Created vector index (dim=%d)", embedding_dim)
         except Exception as e:
-            logger.debug(f"Index creation note for {neo_label}: {e}")
+            logger.warning("  Vector index: %s", e)
 
 
-def import_nodes(conn: Neo4jConnection, df: pd.DataFrame) -> int:
-    """Create nodes from both x and y sides of the dataframe. Returns count."""
-    x_nodes = (
-        df[["x_index", "x_id", "x_type", "x_name", "x_source"]]
-        .drop_duplicates(subset=["x_index"])
-        .rename(columns={"x_index": "idx", "x_id": "ext_id", "x_type": "ntype", "x_name": "name", "x_source": "source"})
-    )
-    y_nodes = (
-        df[["y_index", "y_id", "y_type", "y_name", "y_source"]]
-        .drop_duplicates(subset=["y_index"])
-        .rename(columns={"y_index": "idx", "y_id": "ext_id", "y_type": "ntype", "y_name": "name", "y_source": "source"})
-    )
-    all_nodes = pd.concat([x_nodes, y_nodes]).drop_duplicates(subset=["idx"])
-    logger.info(f"Importing {len(all_nodes)} unique nodes ...")
+def write_triplets(
+    driver,
+    rows: List[dict],
+    embeddings: np.ndarray,
+    database: str = "neo4j",
+) -> int:
+    """Write :Triplet nodes with embeddings to Neo4j in batches."""
+    written = 0
+    with driver.session(database=database) as session:
+        for i in tqdm(range(0, len(rows), WRITE_BATCH_SIZE), desc="Writing triplets"):
+            batch_rows = rows[i : i + WRITE_BATCH_SIZE]
+            batch_embs = embeddings[i : i + WRITE_BATCH_SIZE]
 
-    count = 0
-    for ntype, group in all_nodes.groupby("ntype"):
-        label = _neo4j_label(ntype)
-        records = group.to_dict("records")
+            batch = []
+            for row, emb in zip(batch_rows, batch_embs):
+                batch.append({
+                    "subject": row["subject"],
+                    "predicate": row["predicate"],
+                    "object": row["object"],
+                    "document": f"({row['subject']}, {row['predicate']}, {row['object']})",
+                    "source_text": (
+                        f"subject_type={row.get('subject_type', '')}; "
+                        f"object_type={row.get('object_type', '')}"
+                    ),
+                    "embedding": emb.tolist(),
+                    "source": "primekb",
+                    "mode": "triplet_text",
+                })
 
-        for i in range(0, len(records), BATCH_SIZE):
-            batch = records[i : i + BATCH_SIZE]
-            conn.query(
-                f"UNWIND $batch AS row "
-                f"MERGE (n:{label} {{primekb_id: row.idx}}) "
-                f"ON CREATE SET n.name = row.name, n.ext_id = row.ext_id, "
-                f"n.source = row.source, n.node_type = row.ntype",
+            session.run(
+                """
+                UNWIND $batch AS row
+                MERGE (t:Triplet {
+                    subject: row.subject,
+                    predicate: row.predicate,
+                    object: row.object
+                })
+                ON CREATE SET
+                    t.document = row.document,
+                    t.source_text = row.source_text,
+                    t.embedding = row.embedding,
+                    t.source = row.source,
+                    t.representation_mode = row.mode
+                ON MATCH SET
+                    t.embedding = row.embedding,
+                    t.source = row.source
+                """,
                 {"batch": batch},
             )
-            count += len(batch)
+            written += len(batch)
 
-        logger.info(f"  :{label} -> {len(records)} nodes")
-
-    return count
+    return written
 
 
-def import_relationships(conn: Neo4jConnection, df: pd.DataFrame) -> int:
-    """Create relationships using UNWIND batches. Returns count."""
-    logger.info(f"Importing {len(df)} relationships ...")
-    count = 0
-
-    for rel_name, group in df.groupby("display_relation"):
-        rel_type = _neo4j_rel_type(rel_name)
-        x_label = _neo4j_label(group["x_type"].iloc[0])
-        y_label = _neo4j_label(group["y_type"].iloc[0])
-
-        records = group[["x_index", "y_index"]].rename(
-            columns={"x_index": "x_idx", "y_index": "y_idx"}
-        ).to_dict("records")
-
-        for i in range(0, len(records), BATCH_SIZE):
-            batch = records[i : i + BATCH_SIZE]
-            conn.query(
-                f"UNWIND $batch AS row "
-                f"MATCH (a {{primekb_id: row.x_idx}}) "
-                f"MATCH (b {{primekb_id: row.y_idx}}) "
-                f"MERGE (a)-[r:{rel_type}]->(b)",
-                {"batch": batch},
-            )
-            count += len(batch)
-
-        logger.info(f"  -[:{rel_type}]-> {len(records)} rels ({x_label} -> {y_label})")
-
-    return count
-
-
-def show_stats(conn: Neo4jConnection) -> None:
-    """Print basic graph statistics."""
-    res = conn.query("MATCH (n) RETURN count(n) AS cnt")
-    print(f"\n  Total nodes: {res[0]['cnt']}")
-
-    res = conn.query("MATCH ()-[r]->() RETURN count(r) AS cnt")
-    print(f"  Total relationships: {res[0]['cnt']}")
-
-    res = conn.query("MATCH (n) RETURN DISTINCT labels(n) AS lbl, count(n) AS cnt ORDER BY cnt DESC LIMIT 15")
-    print("\n  Top node labels:")
-    for r in res:
-        print(f"    {r['lbl']}: {r['cnt']}")
-
-    res = conn.query("MATCH ()-[r]->() RETURN type(r) AS t, count(r) AS cnt ORDER BY cnt DESC LIMIT 15")
-    print("\n  Top relationship types:")
-    for r in res:
-        print(f"    {r['t']}: {r['cnt']}")
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Import PrimeKG into Neo4j as a native graph",
+        description="Import PrimeKG CSV into Neo4j as :Triplet nodes with embeddings",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python scripts/import_primekb_to_neo4j.py
+  python scripts/import_primekb_to_neo4j.py --input data/kg.csv --max-rows 50000
+  python scripts/import_primekb_to_neo4j.py --relation-types contraindication,indication
+  python scripts/import_primekb_to_neo4j.py --clear --max-rows 1000
+        """,
     )
-    parser.add_argument("--input", required=True, help="Path to PrimeKG kg.csv")
+    parser.add_argument(
+        "--input", default=DEFAULT_INPUT,
+        help="Path to PrimeKG CSV (default: data/kg_drug_disease.csv)",
+    )
     parser.add_argument("--uri", default="bolt://localhost:7687", help="Neo4j Bolt URI")
-    parser.add_argument("--user", default="neo4j")
-    parser.add_argument("--password", default=os.environ.get("NEO4J_PASSWORD", "password123"))
-    parser.add_argument("--max_rows", type=int, default=None, help="Limit rows loaded")
-    parser.add_argument("--node_types", default=None, help="Comma-separated node types")
-    parser.add_argument("--relation_types", default=None, help="Comma-separated relation types")
-    parser.add_argument("--clear", action="store_true", help="Clear database before import")
-    parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--user", default="neo4j", help="Neo4j username")
+    parser.add_argument(
+        "--password",
+        default=os.environ.get("NEO4J_PASSWORD", "password123"),
+        help="Neo4j password (default: env NEO4J_PASSWORD or password123)",
+    )
+    parser.add_argument(
+        "--max-rows", type=int, default=None,
+        help="Limit number of CSV rows loaded",
+    )
+    parser.add_argument(
+        "--node-types", default=None,
+        help="Comma-separated node types to include (e.g. drug,disease)",
+    )
+    parser.add_argument(
+        "--relation-types", default=None,
+        help="Comma-separated relation types (e.g. contraindication,indication)",
+    )
+    parser.add_argument(
+        "--clear", action="store_true",
+        help="Wipe ALL nodes in the Neo4j database before import",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=os.environ.get("LOCAL_EMBEDDER_MODEL", "BAAI/bge-small-en-v1.5"),
+        help="Sentence-transformer model for embeddings (default: BAAI/bge-small-en-v1.5)",
+    )
+    parser.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -198,51 +322,98 @@ def main():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    node_types = [t.strip() for t in args.node_types.split(",")] if args.node_types else None
-    relation_types = [r.strip() for r in args.relation_types.split(",")] if args.relation_types else None
+    node_types = (
+        [t.strip() for t in args.node_types.split(",")]
+        if args.node_types else None
+    )
+    relation_types = (
+        [r.strip() for r in args.relation_types.split(",")]
+        if args.relation_types else None
+    )
 
-    df = load_data(args.input, max_rows=args.max_rows, node_types=node_types, relation_types=relation_types)
+    # --- Load CSV -----------------------------------------------------------
+    if not os.path.exists(args.input):
+        print(f"ERROR: Input file not found: {args.input}")
+        print("Run  python scripts/download_primekb.py  first to download the dataset.")
+        sys.exit(1)
 
+    df = load_data(
+        args.input,
+        max_rows=args.max_rows,
+        node_types=node_types,
+        relation_types=relation_types,
+    )
     if len(df) == 0:
         print("No data to import after filtering.")
         sys.exit(0)
 
     print("=" * 60)
-    print("PrimeKG -> Neo4j Importer")
+    print("PrimeKG CSV -> Neo4j :Triplet Importer")
     print("=" * 60)
+    print(f"  Input:  {args.input}  ({len(df)} rows)")
 
-    conn = Neo4jConnection(args.uri, args.user, args.password)
+    # --- Deduplicate --------------------------------------------------------
+    rows = deduplicate_triplets(df)
+    print(f"  Unique triplets: {len(rows)}")
+
+    relations = sorted({r["predicate"] for r in rows})
+    print(f"  Relations: {relations}")
+
+    # --- Connect to Neo4j ---------------------------------------------------
+    driver = GraphDatabase.driver(args.uri, auth=(args.user, args.password))
+
     try:
+        existing = count_triplet_nodes(driver)
+        print(f"  Existing Triplet nodes in Neo4j: {existing}")
+
         if args.clear:
-            logger.info("Clearing database ...")
-            conn.query("MATCH (n) DETACH DELETE n")
+            print("\n  Clearing ALL nodes from the database...")
+            cleared = clear_all_nodes(driver)
+            print(f"  Deleted {cleared} nodes.")
 
-        all_types = set(df["x_type"].unique()) | set(df["y_type"].unique())
-        create_indexes(conn, all_types)
+        # --- Generate embeddings --------------------------------------------
+        print(f"\n  Loading embedder: {args.embedding_model}")
+        embedder = get_embedder(model_name=args.embedding_model)
 
+        texts = [
+            f"{r['subject'].replace('_', ' ')} "
+            f"{r['predicate'].replace('_', ' ')} "
+            f"{r['object'].replace('_', ' ')}"
+            for r in rows
+        ]
+
+        print(f"  Generating embeddings for {len(texts)} triplets...")
         t0 = time.time()
-        n_nodes = import_nodes(conn, df)
-        n_rels = import_relationships(conn, df)
-        elapsed = time.time() - t0
+        embeddings = embedder.embed_texts(
+            texts, batch_size=EMBED_BATCH_SIZE, show_progress=True, normalize=True,
+        )
+        embed_time = time.time() - t0
+        print(f"  Embeddings done in {embed_time:.1f}s  (shape: {embeddings.shape})")
 
-        print(f"\nImported {n_nodes} nodes, {n_rels} relationships in {elapsed:.1f}s")
-        show_stats(conn)
+        # --- Indexes --------------------------------------------------------
+        print("\n  Ensuring Triplet indexes...")
+        ensure_triplet_indexes(driver, embedding_dim=embedder.embedding_dim)
+
+        # --- Write ----------------------------------------------------------
+        print(f"\n  Writing {len(rows)} Triplet nodes to Neo4j...")
+        t0 = time.time()
+        written = write_triplets(driver, rows, embeddings)
+        write_time = time.time() - t0
+        print(f"  Wrote {written} Triplet nodes in {write_time:.1f}s")
+
+        total = count_triplet_nodes(driver)
+        print(f"\n  Total Triplet nodes now: {total}")
 
         print("\n" + "=" * 60)
         print("Import complete!")
         print("=" * 60)
-        print("\nNext steps with native PrimeKG graph:")
-        print("  # Convert to :Triplet nodes for demo scripts:")
-        print("  python scripts/convert_primekb_to_triplets.py")
-        print("")
-        print("  # Then run demos:")
+        print("\nNext steps:")
         print("  python scripts/demo_mcp_agent.py --simple")
         print("  python scripts/interactive_agent.py --lite")
-        print("")
-        print("  # Or visualize the native graph directly:")
-        print("  python scripts/visualize_kg.py --schema primekb")
+        print("  python scripts/visualize_kg.py --output outputs/primekb_triplets.png")
+
     finally:
-        conn.close()
+        driver.close()
 
 
 if __name__ == "__main__":

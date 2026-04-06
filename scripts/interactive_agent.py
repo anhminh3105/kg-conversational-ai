@@ -14,7 +14,7 @@ Prerequisites:
 - Neo4j running at bolt://localhost:7687
 - Knowledge graph data loaded via one of:
     Path A (RAG pipeline): index_rag.py + migrate_faiss_to_neo4j.py
-    Path B (PrimeKB native): import_primekb_to_neo4j.py + convert_primekb_to_triplets.py
+    Path B (PrimeKB): import_primekb_to_neo4j.py
 - For full mode: GPU with ~6GB VRAM for Qwen2.5-7B with 4-bit quantization
 - For lite mode: API backend configured (export_google_ai.sh or similar)
 - For validation mode: Remote LLM configured (export_dual_llm.sh)

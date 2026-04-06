@@ -137,6 +137,24 @@ rm -rf ~/tools/neo4j-community-5.26.0/data/*
 ~/tools/neo4j-community-5.26.0/bin/neo4j start
 ```
 
+#### Fast database wipe (without Cypher)
+
+Deleting millions of nodes via Cypher (`MATCH (n) DETACH DELETE n`) can take hours on
+large databases. The fastest way to wipe a Neo4j Community database is to delete the
+data files directly:
+
+```bash
+~/tools/neo4j-community-5.26.0/bin/neo4j stop
+
+rm -rf ~/tools/neo4j-community-5.26.0/data/databases/neo4j
+rm -rf ~/tools/neo4j-community-5.26.0/data/transactions/neo4j
+
+~/tools/neo4j-community-5.26.0/bin/neo4j start
+```
+
+Neo4j recreates an empty `neo4j` database on startup. This takes seconds regardless
+of how many nodes were stored. Use this when re-importing data from scratch.
+
 ## 📊 Project Structure
 
 ```
@@ -171,8 +189,7 @@ kg-conversational-ai/
 │           └── primekb_schema.csv  # PrimeKG relation definitions
 ├── scripts/
 │   ├── import_kg_data_from_json.py # Movie data import script
-│   ├── import_primekb_to_neo4j.py  # PrimeKG -> Neo4j graph import
-│   ├── convert_primekb_to_triplets.py # Bridge: native PrimeKG -> :Triplet nodes
+│   ├── import_primekb_to_neo4j.py  # PrimeKG CSV -> Neo4j :Triplet nodes (with embeddings)
 │   ├── download_primekb.py         # Download PrimeKG from Harvard Dataverse
 │   ├── nlp_to_cypher.py            # ML-based NLP-to-Cypher
 │   ├── llm_light_train.py          # Transformer training
@@ -182,7 +199,11 @@ kg-conversational-ai/
 │   ├── interactive_agent.py        # MCP Agent interactive REPL
 │   ├── migrate_faiss_to_neo4j.py   # Migrate FAISS index → Neo4j
 │   ├── visualize_kg.py             # KG visualization (Triplet + PrimeKG schemas)
-│   └── visulize_graph.py           # Graph visualization (movie data)
+│   ├── visulize_graph.py           # Graph visualization (movie data)
+│   └── eval/                       # Evaluation suite (PrimeKG drug-disease)
+│       ├── split_primekb.py        # Stratified entity-disjoint train/test split
+│       ├── generate_qa.py          # LLM-generated QA pairs from test triplets
+│       └── evaluate.py             # Run system + compute metrics (EM, F1, etc.)
 ├── export_google_ai.sh             # Google AI Studio config
 ├── export_sambanova.sh             # SambaNova config
 ├── export_local_llm.sh             # Local LLM config
@@ -366,27 +387,28 @@ python scripts/index_rag.py --input ./data/kg.csv --format primekb \
 python scripts/index_rag.py --load ./output/rag_primekb --auto_filter --query "What drugs treat diabetes?" --top_k 50
 ```
 
-**Import PrimeKG into Neo4j (native graph):**
-```bash
-python scripts/import_primekb_to_neo4j.py --input ./data/kg.csv
-python scripts/import_primekb_to_neo4j.py --input ./data/kg.csv \
-  --node_types drug,disease --max_rows 50000
-```
+**Import PrimeKG into Neo4j as :Triplet nodes (one step):**
 
-**Bridge native PrimeKG graph to demo scripts:**
-
-The native Neo4j import creates typed nodes (`:Drug`, `:Disease`) with typed
-relationships, which is a different schema from the `:Triplet` nodes the demo
-scripts expect. Use the bridge script to convert:
+Reads the CSV and writes flat `:Triplet` nodes with vector embeddings directly
+to Neo4j, ready for the demo scripts and RAG pipeline.
 
 ```bash
-# After import_primekb_to_neo4j.py, convert for demo compatibility
-python scripts/convert_primekb_to_triplets.py
+# Default: import the drug-disease subset (~42K rows)
+python scripts/import_primekb_to_neo4j.py
 
-# Filter by node types or limit rows
-python scripts/convert_primekb_to_triplets.py --node-types drug,disease --max-rows 50000
+# Import the full PrimeKG dataset
+python scripts/import_primekb_to_neo4j.py --input data/kg.csv
 
-# Now demos work with PrimeKB data
+# Wipe all existing nodes first, then import
+python scripts/import_primekb_to_neo4j.py --clear
+
+# Limit rows for a quick test
+python scripts/import_primekb_to_neo4j.py --max-rows 500
+
+# Filter by relation types
+python scripts/import_primekb_to_neo4j.py --relation-types contraindication,indication
+
+# Now demos work with PrimeKG data
 python scripts/demo_mcp_agent.py --simple
 python scripts/interactive_agent.py --lite
 ```
@@ -659,6 +681,53 @@ You: /quit
 | `--expand` | Run triplet expansion demo then exit |
 | `--persist` | Persist expanded triplets (use with `--expand`) |
 | `--neo4j-password` | Neo4j password (default: env or `password123`) |
+
+### 6. Evaluation Suite -- PrimeKG Drug-Disease
+
+Quantitative evaluation of the KG-RAG system using the PrimeKG drug-disease subset (indication, contraindication, off-label use). Compares three configurations: pure RAG, agent without validation, and the full system with dual-LLM validation.
+
+#### Step 1: Extract and split the dataset
+
+```bash
+# Extract drug-disease subset from PrimeKG (~43K rows)
+python scripts/download_primekb.py --skip_summary
+
+# Stratified entity-disjoint train/test split (20% test)
+python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv
+```
+
+#### Step 2: Generate QA dataset
+
+Uses the remote LLM (Gemini) to generate diverse, natural questions from the test triplets. Requires `source export_google_ai.sh` first.
+
+```bash
+source export_google_ai.sh
+python scripts/eval/generate_qa.py
+```
+
+Questions are cached incrementally to `data/eval/qa_questions_cache.json`. If interrupted (e.g. by rate limits), re-running resumes from where it left off.
+
+#### Step 3: Evaluate
+
+```bash
+# Run all three configs
+python scripts/eval/evaluate.py --configs A B C --verbose
+
+# Run only pure RAG
+python scripts/eval/evaluate.py --configs A
+```
+
+**Evaluation configurations:**
+
+| Config | Description | Requirements |
+|--------|-------------|-------------|
+| **A** | Pure RAG (no expansion) | FAISS index |
+| **B** | Agent without validation | Neo4j + local LLM |
+| **C** | Full system with dual-LLM validation | Neo4j + local LLM + remote LLM |
+
+**Metrics:** Exact Match, Token F1, Answer Rate, Hallucination Proxy, Mean Latency. Reported per-relation and overall.
+
+See [`scripts/eval/README.md`](scripts/eval/README.md) for the full CLI reference and output file descriptions.
 
 ## 📝 Adding New Training Data
 

@@ -7,9 +7,14 @@ Downloads:
   - drug_features.csv  (optional)
   - disease_features.csv (optional)
 
+After download, extracts a drug-disease subset by default (can be skipped
+with --no-extract).
+
 Usage:
-    python scripts/download_primekb.py                          # kg.csv only
+    python scripts/download_primekb.py                          # kg.csv + extract drug-disease
     python scripts/download_primekb.py --all                    # all three files
+    python scripts/download_primekb.py --no-extract             # skip subset extraction
+    python scripts/download_primekb.py --extract drug-disease   # explicit subset
     python scripts/download_primekb.py --output_dir ./my_data   # custom dir
 """
 
@@ -97,6 +102,56 @@ def download_file(url: str, dest: str) -> None:
     print(f"  Saved {size_mb:.1f} MB in {elapsed:.0f}s -> {dest}")
 
 
+SUBSET_FILTERS = {
+    "drug-disease": {
+        "x_type": "drug",
+        "y_type": "disease",
+        "description": "Drug-disease edges (indication, contraindication, off-label use)",
+    },
+}
+
+
+def extract_subset(kg_path: str, output_dir: str, subset: str = "drug-disease") -> str:
+    """Extract a node-type-pair subset from kg.csv and save as a separate CSV.
+
+    Returns the path to the extracted file, or raises if the subset is unknown.
+    """
+    if subset not in SUBSET_FILTERS:
+        raise ValueError(
+            f"Unknown subset '{subset}'. Available: {list(SUBSET_FILTERS.keys())}"
+        )
+
+    filt = SUBSET_FILTERS[subset]
+    out_name = f"kg_{subset.replace('-', '_')}.csv"
+    out_path = os.path.join(output_dir, out_name)
+
+    try:
+        import pandas as pd
+    except ImportError:
+        print("  pandas is required for --extract.  pip install pandas")
+        sys.exit(1)
+
+    print(f"\nExtracting '{subset}' subset ({filt['description']}) ...")
+
+    first_line = open(kg_path, encoding="utf-8").readline().strip()
+    skiprows = 1 if not first_line.startswith("relation") else 0
+
+    df = pd.read_csv(kg_path, skiprows=skiprows, low_memory=False)
+    mask = (df["x_type"] == filt["x_type"]) & (df["y_type"] == filt["y_type"])
+    filtered = df[mask]
+
+    if filtered.empty:
+        print(f"  WARNING: no rows matched {filt}. Skipping extraction.")
+        return ""
+
+    filtered.to_csv(out_path, index=False)
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    relations = sorted(filtered["display_relation"].unique())
+    print(f"  {len(filtered):,} rows, {size_mb:.1f} MB -> {out_path}")
+    print(f"  Relations: {relations}")
+    return out_path
+
+
 def summarize_kg(path: str) -> None:
     """Print a quick summary of the downloaded kg.csv."""
     try:
@@ -138,6 +193,16 @@ def main():
         action="store_true",
         help="Skip printing dataset summary after download",
     )
+    parser.add_argument(
+        "--extract",
+        default="drug-disease",
+        help="Subset to extract after download (default: drug-disease)",
+    )
+    parser.add_argument(
+        "--no-extract",
+        action="store_true",
+        help="Skip subset extraction (keep only the full kg.csv)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -164,18 +229,32 @@ def main():
     if not args.skip_summary and os.path.exists(kg_path):
         summarize_kg(kg_path)
 
+    # --- Subset extraction ---
+    subset_path = ""
+    if not args.no_extract and os.path.exists(kg_path):
+        subset_path = extract_subset(kg_path, args.output_dir, subset=args.extract)
+
     print("\n" + "=" * 60)
     print("Done! Next steps:")
-    print(f"\n  Path A — For use with demo scripts (RAG pipeline):")
-    print(f"    python scripts/index_rag.py --input {kg_path} --format primekb \\")
-    print(f"        --node_types drug,disease --output_dir ./output/rag_primekb")
+
+    if subset_path:
+        print(f"\n  Path A — Evaluation suite (drug-disease subset):")
+        print(f"    python scripts/eval/split_primekb.py --input {subset_path}")
+        print(f"    python scripts/eval/generate_qa.py --test-csv data/eval/test.csv")
+        print(f"    python scripts/eval/evaluate.py --qa-dataset data/eval/qa_dataset.json")
+
+    print(f"\n  Path B — RAG pipeline (full or filtered dataset):")
+    input_file = subset_path or kg_path
+    print(f"    python scripts/index_rag.py --input {input_file} --format primekb \\")
+    print(f"        --output_dir ./output/rag_primekb")
     print(f"    python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb")
     print(f"    python scripts/demo_mcp_agent.py              # run demo")
     print(f"    python scripts/interactive_agent.py            # interactive chat")
-    print(f"\n  Path B — For native graph exploration:")
-    print(f"    python scripts/import_primekb_to_neo4j.py --input {kg_path}")
-    print(f"    python scripts/convert_primekb_to_triplets.py  # bridge to :Triplet nodes")
-    print(f"    python scripts/visualize_kg.py --schema primekb")
+    print(f"\n  Path C — Import into Neo4j as :Triplet nodes:")
+    input_file_c = subset_path or kg_path
+    print(f"    python scripts/import_primekb_to_neo4j.py --input {input_file_c}")
+    print(f"    python scripts/demo_mcp_agent.py              # run demo")
+    print(f"    python scripts/interactive_agent.py            # interactive chat")
     print("=" * 60)
 
 
