@@ -2,13 +2,17 @@
 """
 Evaluate the KG-RAG system on the PrimeKG drug-disease QA dataset.
 
-Runs three configurations and computes metrics per-relation and overall:
+All configs use Neo4j as the knowledge store.
 
-    Config A  – Pure RAG          (KGRagGenerator, no expansion)
+    Config A  – Pure RAG          (KGRagGenerator + Neo4j, no expansion)
     Config B  – Agent, no valid.  (MCPAgentWithValidation, validation off)
     Config C  – Full system       (MCPAgentWithValidation, validation on)
 
 Metrics: Exact Match, Token F1, Answer Rate, Hallucination Proxy, Latency.
+
+Prerequisites:
+    source export_local_qwen3.sh   # or export_google_ai.sh
+    # Neo4j must be running with PrimeKG data indexed
 
 Usage:
     python scripts/eval/evaluate.py --qa-dataset data/eval/qa_dataset.json
@@ -26,6 +30,12 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
+
+_project_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 logger = logging.getLogger(__name__)
 
@@ -124,24 +134,41 @@ class QuestionResult:
 
 def _run_config_a(
     questions: list[dict],
+    store_type: str,
+    neo4j_uri: str,
+    neo4j_password: str,
     index_dir: str,
     verbose: bool,
 ) -> list[QuestionResult]:
-    """Config A: Pure RAG via KGRagGenerator."""
+    """Config A: Pure RAG via KGRagGenerator (Neo4j or FAISS backend)."""
     try:
         from rag.kg_rag_indexer import KGRagIndexer
         from rag.generator import KGRagGenerator
-    except ImportError as e:
-        logger.error(f"Cannot import RAG modules: {e}")
+    except Exception as e:
+        logger.error(
+            f"Cannot import RAG modules: {e}\n"
+            "  Ensure an LLM backend is configured:\n"
+            "    source export_local_qwen3.sh   (local)\n"
+            "    source export_google_ai.sh     (remote)"
+        )
         return []
 
     try:
-        indexer = KGRagIndexer.load(index_dir)
+        if store_type == "faiss":
+            indexer = KGRagIndexer.load(index_dir)
+            logger.info(f"Config A: loaded FAISS index from {index_dir}")
+        else:
+            indexer = KGRagIndexer(
+                store_type="neo4j",
+                neo4j_uri=neo4j_uri,
+                neo4j_password=neo4j_password,
+            )
+            logger.info(f"Config A: connected to Neo4j at {neo4j_uri}")
     except Exception as e:
-        logger.error(f"Config A: failed to load index from {index_dir}: {e}")
+        logger.error(f"Config A: failed to initialize {store_type} store: {e}")
         return []
 
-    generator = KGRagGenerator(indexer, index_path=index_dir)
+    generator = KGRagGenerator(indexer)
     judger = QAJudger()
     results: list[QuestionResult] = []
 
@@ -195,8 +222,13 @@ def _run_config_bc(
     config_label = "C" if enable_validation else "B"
     try:
         from rag.mcp_agent import create_mcp_agent_with_validation
-    except ImportError as e:
-        logger.error(f"Cannot import agent module: {e}")
+    except Exception as e:
+        logger.error(
+            f"Cannot import agent module: {e}\n"
+            "  Ensure an LLM backend is configured:\n"
+            "    source export_local_qwen3.sh   (local)\n"
+            "    source export_google_ai.sh     (remote)"
+        )
         return []
 
     try:
@@ -231,7 +263,7 @@ def _run_config_bc(
             retrieved_strs = [
                 str(tc.get("result", ""))
                 for tc in res.tool_calls
-                if tc.get("tool") == "search_knowledge"
+                if tc.get("tool") in ("search_knowledge", "search_knowledge_graph")
             ]
             qr.exact_match = judger.exact_match(res.answer, q["gold_answers"])
             qr.token_f1 = judger.token_f1(res.answer, q["gold_answers"])
@@ -322,6 +354,7 @@ def evaluate(
     qa_path: str,
     configs: list[str],
     output_path: str,
+    store_type: str = "neo4j",
     index_dir: str = "./output/rag_primekb",
     neo4j_uri: str = "bolt://localhost:7687",
     neo4j_password: str = "password123",
@@ -345,7 +378,14 @@ def evaluate(
         print(f"{'='*60}")
 
         if cfg == "A":
-            results = _run_config_a(questions, index_dir, verbose)
+            results = _run_config_a(
+                questions,
+                store_type=store_type,
+                neo4j_uri=neo4j_uri,
+                neo4j_password=neo4j_password,
+                index_dir=index_dir,
+                verbose=verbose,
+            )
         elif cfg == "B":
             results = _run_config_bc(
                 questions,
@@ -494,14 +534,21 @@ def main() -> None:
         help="Output report JSON (default: data/eval/eval_report.json)",
     )
     parser.add_argument(
+        "--store-type",
+        choices=["neo4j", "faiss"],
+        default="neo4j",
+        help="Backend for Config A retrieval (default: neo4j)",
+    )
+    parser.add_argument(
         "--index-dir",
         default="./output/rag_primekb",
-        help="FAISS index directory for Config A (default: ./output/rag_primekb)",
+        help="FAISS index directory, used only with --store-type faiss "
+             "(default: ./output/rag_primekb)",
     )
     parser.add_argument(
         "--neo4j-uri",
         default="bolt://localhost:7687",
-        help="Neo4j Bolt URI for Configs B/C (default: bolt://localhost:7687)",
+        help="Neo4j Bolt URI (default: bolt://localhost:7687)",
     )
     parser.add_argument(
         "--neo4j-password",
@@ -535,6 +582,7 @@ def main() -> None:
         qa_path=args.qa_dataset,
         configs=args.configs,
         output_path=args.output,
+        store_type=args.store_type,
         index_dir=args.index_dir,
         neo4j_uri=args.neo4j_uri,
         neo4j_password=neo4j_password,
