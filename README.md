@@ -698,14 +698,19 @@ python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv
 
 #### Step 2: Generate QA dataset
 
-Uses the remote LLM (Gemini) to generate diverse, natural questions from the test triplets. Requires `source export_google_ai.sh` first.
+Uses an LLM to generate diverse, natural questions from the test triplets. Supports local (default) or remote models.
 
 ```bash
-source export_google_ai.sh
+# Local LLM (default)
+source export_local_qwen3.sh
 python scripts/eval/generate_qa.py
+
+# Or remote LLM (e.g. Gemini)
+source export_google_ai.sh
+python scripts/eval/generate_qa.py --remote-llm
 ```
 
-Questions are cached incrementally to `data/eval/qa_questions_cache.json`. If interrupted (e.g. by rate limits), re-running resumes from where it left off.
+The output file (`qa_dataset.json`) doubles as an incremental cache. If interrupted, re-running resumes from where it left off.
 
 #### Step 3: Evaluate
 

@@ -27,7 +27,6 @@ import random
 import re
 import sys
 import time
-from typing import Optional
 
 # Ensure the project root is on sys.path so `from rag...` imports work.
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -256,53 +255,133 @@ def _parse_llm_response(raw: str, expected_entities: list[str]) -> dict[str, str
     return result
 
 
-def _generate_all_questions(
-    entity_lists: dict[tuple[str, str], list[str]],
+# ---------------------------------------------------------------------------
+# Build QA records (single-pass: generate questions + assemble records)
+# ---------------------------------------------------------------------------
+
+def _record_key(rec: dict) -> str:
+    """Derive a unique resume key from a QA record."""
+    return f"{rec['entity']}|{rec['relation']}|{rec['direction']}"
+
+
+def _build_record(
+    entity: str,
+    question: str,
+    gold_answers: list[str],
+    relation: str,
+    direction: str,
+) -> dict:
+    """Build a single QA record dict (ID is assigned later)."""
+    if direction == "forward":
+        triplets = [f"({entity}, {relation}, {a})" for a in gold_answers]
+    else:
+        triplets = [f"({a}, {relation}, {entity})" for a in gold_answers]
+    return {
+        "id": "",
+        "entity": entity,
+        "question": question,
+        "gold_answers": gold_answers,
+        "relation": relation,
+        "direction": direction,
+        "source_triplets": triplets,
+    }
+
+
+def _save_records(records: list[dict], path: str) -> None:
+    """Write the full records list to disk (atomic-ish via write+flush)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(records, f, indent=2)
+
+
+def _build_questions(
+    df: pd.DataFrame,
+    max_per_relation: int,
+    rng: random.Random,
     batch_size: int,
-    cache_path: str | None,
+    output_path: str,
     use_cache: bool,
-) -> dict[str, str]:
-    """Generate questions for all (relation, direction, entity) combos.
+) -> list[dict]:
+    """Generate LLM questions and assemble complete QA records in one pass.
 
-    Returns a flat dict keyed by "entity|relation|direction" -> question.
+    The output file doubles as an incremental cache: if *use_cache* is True
+    and *output_path* already exists, previously generated records are loaded
+    and their entities are skipped.
     """
-    # Load existing cache (supports incremental resumption)
-    questions: dict[str, str] = {}
-    if use_cache and cache_path and os.path.exists(cache_path):
-        with open(cache_path) as f:
-            questions = json.load(f)
+    relations = sorted(RELATION_CONTEXT.keys())
 
-        needed_keys = set()
-        for (relation, direction), entities in entity_lists.items():
-            for e in entities:
-                needed_keys.add(f"{e}|{relation}|{direction}")
+    # -- Collect entity lists and gold-answer groups from the test CSV ------
+    entity_lists: dict[tuple[str, str], list[str]] = {}
+    answer_groups: dict[tuple[str, str], dict[str, list[str]]] = {}
 
-        if needed_keys.issubset(set(questions.keys())):
-            logger.info(f"Cache hit: all {len(needed_keys)} questions found in {cache_path}")
-            return questions
-        else:
-            missing = len(needed_keys - set(questions.keys()))
-            logger.info(f"Cache partial: {len(questions)} cached, {missing} still needed")
+    for relation in relations:
+        rel_df = df[df["display_relation"] == relation]
+        if rel_df.empty:
+            logger.warning(f"No test rows for relation '{relation}', skipping")
+            continue
 
+        fwd = (
+            rel_df.groupby("x_name")["y_name"]
+            .apply(lambda s: sorted(s.unique().tolist()))
+            .to_dict()
+        )
+        fwd_keys = list(fwd.keys())
+        rng.shuffle(fwd_keys)
+        fwd_keys = fwd_keys[:max_per_relation]
+        entity_lists[(relation, "forward")] = fwd_keys
+        answer_groups[(relation, "forward")] = fwd
+
+        rev = (
+            rel_df.groupby("y_name")["x_name"]
+            .apply(lambda s: sorted(s.unique().tolist()))
+            .to_dict()
+        )
+        rev_keys = list(rev.keys())
+        rng.shuffle(rev_keys)
+        rev_keys = rev_keys[:max_per_relation]
+        entity_lists[(relation, "reverse")] = rev_keys
+        answer_groups[(relation, "reverse")] = rev
+
+    # -- Resume: load existing records if available -------------------------
+    records: list[dict] = []
+    done_keys: set[str] = set()
+
+    if use_cache and os.path.exists(output_path):
+        try:
+            with open(output_path) as f:
+                records = json.load(f)
+            done_keys = {_record_key(r) for r in records}
+            logger.info(
+                f"Resumed {len(records)} existing records from {output_path}"
+            )
+        except (json.JSONDecodeError, KeyError) as exc:
+            logger.warning(f"Could not resume from {output_path}: {exc}")
+            records, done_keys = [], set()
+
+    # -- Generate + build records in one pass -------------------------------
+    total_entities = sum(len(v) for v in entity_lists.values())
     total_batches = sum(
-        (len(entities) + batch_size - 1) // batch_size
-        for entities in entity_lists.values()
+        (len(ents) + batch_size - 1) // batch_size
+        for ents in entity_lists.values()
     )
+    logger.info(
+        f"Generating questions for {total_entities} entities "
+        f"across {len(entity_lists)} (relation, direction) combos ..."
+    )
+
     batch_num = 0
     batches_called = 0
 
-    if cache_path:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-
     for (relation, direction), entities in entity_lists.items():
+        golds = answer_groups[(relation, direction)]
+
         for i in range(0, len(entities), batch_size):
             batch = entities[i : i + batch_size]
             batch_num += 1
 
-            # Skip entities already in cache
             uncached = [
                 e for e in batch
-                if f"{e}|{relation}|{direction}" not in questions
+                if f"{e}|{relation}|{direction}" not in done_keys
             ]
             if not uncached:
                 logger.info(
@@ -311,7 +390,6 @@ def _generate_all_questions(
                 )
                 continue
 
-            # Rate-limit: wait between remote API calls (not needed for local LLM)
             if batches_called > 0 and not _is_local_llm():
                 time.sleep(12)
 
@@ -324,136 +402,34 @@ def _generate_all_questions(
             batches_called += 1
 
             for entity in uncached:
-                key = f"{entity}|{relation}|{direction}"
                 if entity in generated:
-                    questions[key] = generated[entity]
+                    q_text = generated[entity]
                 else:
-                    fallback = FALLBACK_TEMPLATES[relation][direction]
-                    questions[key] = fallback.format(entity=entity)
+                    q_text = FALLBACK_TEMPLATES[relation][direction].format(
+                        entity=entity
+                    )
                     logger.warning(
                         f"  Fallback for '{entity}' ({relation}/{direction})"
                     )
 
-            # Incremental save after each batch
-            if cache_path:
-                with open(cache_path, "w") as f:
-                    json.dump(questions, f, indent=2)
+                records.append(_build_record(
+                    entity=entity,
+                    question=q_text,
+                    gold_answers=golds[entity],
+                    relation=relation,
+                    direction=direction,
+                ))
+                done_keys.add(f"{entity}|{relation}|{direction}")
 
-    if cache_path:
-        logger.info(f"Saved {len(questions)} questions to cache: {cache_path}")
+            _save_records(records, output_path)
 
-    return questions
+    # -- Re-number IDs so they are contiguous -------------------------------
+    for idx, rec in enumerate(records):
+        rec["id"] = f"q{idx:04d}"
+    _save_records(records, output_path)
 
-
-# ---------------------------------------------------------------------------
-# Build QA items (same output format as before)
-# ---------------------------------------------------------------------------
-
-def _build_questions(
-    df: pd.DataFrame,
-    max_per_relation: int,
-    rng: random.Random,
-    batch_size: int,
-    cache_path: str | None,
-    use_cache: bool,
-) -> list[dict]:
-    """Build QA items using LLM-generated questions."""
-
-    relations = sorted(RELATION_CONTEXT.keys())
-
-    # First pass: collect the entities we need questions for
-    entity_lists: dict[tuple[str, str], list[str]] = {}
-    grouped_data: dict[str, dict] = {}
-
-    for relation in relations:
-        rel_df = df[df["display_relation"] == relation]
-        if rel_df.empty:
-            logger.warning(f"No test rows for relation '{relation}', skipping")
-            continue
-
-        forward_groups = (
-            rel_df.groupby("x_name")["y_name"]
-            .apply(lambda s: sorted(s.unique().tolist()))
-            .to_dict()
-        )
-        fwd_keys = list(forward_groups.keys())
-        rng.shuffle(fwd_keys)
-        fwd_keys = fwd_keys[:max_per_relation]
-        entity_lists[(relation, "forward")] = fwd_keys
-
-        reverse_groups = (
-            rel_df.groupby("y_name")["x_name"]
-            .apply(lambda s: sorted(s.unique().tolist()))
-            .to_dict()
-        )
-        rev_keys = list(reverse_groups.keys())
-        rng.shuffle(rev_keys)
-        rev_keys = rev_keys[:max_per_relation]
-        entity_lists[(relation, "reverse")] = rev_keys
-
-        grouped_data[relation] = {
-            "forward_groups": forward_groups,
-            "forward_keys": fwd_keys,
-            "reverse_groups": reverse_groups,
-            "reverse_keys": rev_keys,
-        }
-
-    # Second pass: generate all questions via LLM
-    total_entities = sum(len(v) for v in entity_lists.values())
-    logger.info(
-        f"Generating questions for {total_entities} entities "
-        f"across {len(entity_lists)} (relation, direction) combos ..."
-    )
-    question_map = _generate_all_questions(
-        entity_lists, batch_size, cache_path, use_cache
-    )
-
-    # Third pass: assemble QA items
-    questions: list[dict] = []
-    qid = 0
-
-    for relation in relations:
-        if relation not in grouped_data:
-            continue
-        data = grouped_data[relation]
-
-        for drug in data["forward_keys"]:
-            diseases = data["forward_groups"][drug]
-            key = f"{drug}|{relation}|forward"
-            q_text = question_map.get(
-                key, FALLBACK_TEMPLATES[relation]["forward"].format(entity=drug)
-            )
-            questions.append({
-                "id": f"q{qid:04d}",
-                "question": q_text,
-                "gold_answers": diseases,
-                "relation": relation,
-                "direction": "forward",
-                "source_triplets": [
-                    f"({drug}, {relation}, {d})" for d in diseases
-                ],
-            })
-            qid += 1
-
-        for disease in data["reverse_keys"]:
-            drugs = data["reverse_groups"][disease]
-            key = f"{disease}|{relation}|reverse"
-            q_text = question_map.get(
-                key, FALLBACK_TEMPLATES[relation]["reverse"].format(entity=disease)
-            )
-            questions.append({
-                "id": f"q{qid:04d}",
-                "question": q_text,
-                "gold_answers": drugs,
-                "relation": relation,
-                "direction": "reverse",
-                "source_triplets": [
-                    f"({dr}, {relation}, {disease})" for dr in drugs
-                ],
-            })
-            qid += 1
-
-    return questions
+    logger.info(f"Generated {len(records)} QA pairs -> {output_path}")
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -466,30 +442,21 @@ def generate_qa(
     max_per_relation: int = 100,
     seed: int = 42,
     batch_size: int = 15,
-    cache_path: str | None = None,
     use_cache: bool = True,
 ) -> list[dict]:
-    """Read test CSV, generate LLM questions, build QA, write JSON."""
+    """Read test CSV, generate LLM questions, build QA, write JSON.
+
+    The *output_path* file serves as both the final dataset and an incremental
+    cache.  Pass *use_cache=False* to regenerate from scratch.
+    """
     rng = random.Random(seed)
 
     df = pd.read_csv(test_csv, low_memory=False)
     logger.info(f"Loaded {len(df):,} test rows from {test_csv}")
 
-    if cache_path is None:
-        cache_path = os.path.join(
-            os.path.dirname(output_path), "qa_questions_cache.json"
-        )
-
-    questions = _build_questions(
-        df, max_per_relation, rng, batch_size, cache_path, use_cache
+    return _build_questions(
+        df, max_per_relation, rng, batch_size, output_path, use_cache
     )
-
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump(questions, f, indent=2)
-
-    logger.info(f"Generated {len(questions)} QA pairs -> {output_path}")
-    return questions
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +492,7 @@ def main() -> None:
     parser.add_argument(
         "--no-cache",
         action="store_true",
-        help="Force regeneration, ignoring any existing cache",
+        help="Force regeneration, ignoring any existing output file",
     )
     parser.add_argument(
         "--remote-llm",
@@ -561,7 +528,7 @@ def main() -> None:
         max_per_relation=args.max_questions_per_relation,
         seed=args.seed,
         batch_size=args.batch_size,
-        use_cache=not args.no_cache,
+        use_cache=(not args.no_cache),
     )
 
     # --- Summary ---
