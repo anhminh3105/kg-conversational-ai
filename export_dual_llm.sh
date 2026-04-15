@@ -15,6 +15,11 @@
 # =============================================================================
 
 # =============================================================================
+# HUGGING FACE AUTHENTICATION (required for gated models like MedGemma)
+# =============================================================================
+export HF_TOKEN=""
+
+# =============================================================================
 # LOCAL LLM CONFIGURATION (for queries and triplet generation)
 # =============================================================================
 # Enable local LLM mode for primary operations
@@ -28,6 +33,9 @@ export LOCAL_EMBEDDER_MODEL="BAAI/bge-small-en-v1.5"
 
 # Quantization - 4bit recommended for GPU with 16GB or less
 export LOCAL_LLM_QUANTIZE="4bit"
+
+# Thinking mode - set to "true" to enable chain-of-thought reasoning (Qwen3+ models)
+export LOCAL_LLM_ENABLE_THINKING="${LOCAL_LLM_ENABLE_THINKING:-false}"
 
 # =============================================================================
 # REMOTE LLM CONFIGURATION (for triplet validation)
@@ -46,7 +54,10 @@ export LOCAL_LLM_QUANTIZE="4bit"
 # Get your API key from: https://aistudio.google.com/apikey
 export REMOTE_LLM_API_KEY=""
 export REMOTE_LLM_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
-export REMOTE_LLM_MODEL="gemini-2.5-flash-lite"
+export REMOTE_LLM_MODEL="gemma-4-31b-it"
+
+# Optional: cap HTTP wait per validation request (seconds). Falls back to OPENAI_HTTP_TIMEOUT if set.
+# export REMOTE_LLM_HTTP_TIMEOUT=60
 
 # Option 2: OpenAI (uncomment to use)
 # export REMOTE_LLM_API_KEY="YOUR_OPENAI_API_KEY"
@@ -77,6 +88,7 @@ echo "  USE_LOCAL_LLM:        $USE_LOCAL_LLM"
 echo "  LOCAL_LLM_MODEL:      $LOCAL_LLM_MODEL"
 echo "  LOCAL_EMBEDDER_MODEL: $LOCAL_EMBEDDER_MODEL"
 echo "  LOCAL_LLM_QUANTIZE:   $LOCAL_LLM_QUANTIZE"
+echo "  ENABLE_THINKING:      $LOCAL_LLM_ENABLE_THINKING"
 echo ""
 echo "REMOTE LLM (validation & fact-checking):"
 echo "  REMOTE_LLM_MODEL:     $REMOTE_LLM_MODEL"
@@ -92,9 +104,11 @@ echo "  NEO4J_URI:            $NEO4J_URI"
 echo "  NEO4J_USER:           $NEO4J_USER"
 echo "=============================================="
 echo ""
-echo "To run the dual-LLM demo:"
+echo "To run the dual-LLM batch demo:"
 echo "  python scripts/demo_mcp_agent.py --validated-expand"
-echo ""
-echo "To run with verbose output:"
 echo "  python scripts/demo_mcp_agent.py --validated-expand --verbose"
+echo ""
+echo "To start an interactive session with validation:"
+echo "  python scripts/interactive_agent.py --validate"
+echo "  python scripts/interactive_agent.py --validate --verbose"
 echo ""

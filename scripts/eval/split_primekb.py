@@ -4,16 +4,19 @@ Split the PrimeKG drug-disease subset into train/test with evaluation tiers.
 
 For each relation type, drugs (x_name) are grouped and split so that no drug
 appears in both train and test for the same relation.  Test entities are then
-assigned to one of three evaluation tiers:
+assigned to one of two evaluation tiers:
 
-    Full    (default 10%) -- all gold triples included in train.csv
-    Partial (default 80%) -- ~50% of gold triples included in train.csv
-    Zero    (default 10%) -- no gold triples included in train.csv
+    Full    -- all gold triples included in train.csv  (retrieval test)
+    Partial -- only a subset of gold triples in train.csv  (recovery test)
+
+Partial-tier drugs must have >= 2 triples per relation so that at least one
+triple can be held out while keeping context in the KG.  Single-triple drugs
+are automatically assigned to the Full tier.
 
 Outputs (to --output-dir, default data/eval/):
     train.csv              -- KG to load into Neo4j (background + tier-appropriate gold)
     test.csv               -- all test entity triples (for QA generation)
-    tier_assignments.json  -- {entity: {relation: tier}} mapping
+    tier_assignments.json  -- {entity: {relation: {tier, kg_answers, held_out_answers}}}
     split_stats.json       -- per-relation and per-tier statistics
 
 Usage:
@@ -29,13 +32,40 @@ import json
 import logging
 import os
 import sys
-from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _drug_aware_sample(
+    df: pd.DataFrame,
+    max_rows: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Sample complete drugs (keeping all their triples) up to *max_rows* rows.
+
+    Unlike row-level sampling, this preserves multi-triple drug groups which
+    are essential for the Partial tier.
+    """
+    drug_counts = (
+        df.groupby("x_name")
+        .size()
+        .reset_index(name="count")
+        .sample(frac=1, random_state=seed)
+    )
+    cumsum = drug_counts["count"].cumsum()
+    keep_drugs = drug_counts.loc[cumsum <= max_rows, "x_name"]
+    if len(keep_drugs) == 0:
+        keep_drugs = drug_counts.iloc[:1]["x_name"]
+    sampled = df[df["x_name"].isin(keep_drugs)]
+    logger.info(
+        f"Drug-aware sampling: kept {len(keep_drugs)} drugs, "
+        f"{len(sampled):,} rows (--max-rows {max_rows})"
+    )
+    return sampled
 
 
 def entity_disjoint_split(
@@ -65,25 +95,24 @@ def entity_disjoint_split(
 
 def assign_tiers(
     test_drugs: list[str],
+    drug_triple_counts: dict[str, int],
     rng: np.random.Generator,
-    full_ratio: float = 0.10,
-    zero_ratio: float = 0.10,
+    full_ratio: float = 0.30,
 ) -> dict[str, str]:
-    """Assign each test drug to a tier: full, partial, or zero."""
-    drugs = list(test_drugs)
-    rng.shuffle(drugs)
-    n = len(drugs)
-    n_full = max(1, int(n * full_ratio))
-    n_zero = max(1, int(n * zero_ratio))
+    """Assign each test drug to Full or Partial tier.
 
-    assignments: dict[str, str] = {}
-    for i, drug in enumerate(drugs):
-        if i < n_full:
-            assignments[drug] = "full"
-        elif i < n_full + n_zero:
-            assignments[drug] = "zero"
-        else:
-            assignments[drug] = "partial"
+    Single-triple drugs always go to Full (cannot hold out triples).
+    Multi-triple drugs are split according to *full_ratio*.
+    """
+    single = [d for d in test_drugs if drug_triple_counts.get(d, 1) < 2]
+    multi = [d for d in test_drugs if drug_triple_counts.get(d, 1) >= 2]
+
+    assignments: dict[str, str] = {d: "full" for d in single}
+
+    rng.shuffle(multi)
+    n_full = max(1, int(len(multi) * full_ratio)) if multi else 0
+    for i, drug in enumerate(multi):
+        assignments[drug] = "full" if i < n_full else "partial"
     return assignments
 
 
@@ -93,8 +122,7 @@ def split_dataset(
     test_ratio: float = 0.2,
     seed: int = 42,
     max_rows: Optional[int] = None,
-    full_ratio: float = 0.10,
-    zero_ratio: float = 0.10,
+    full_ratio: float = 0.30,
     partial_include: float = 0.50,
 ) -> dict:
     """Load, split, assign tiers, save, and return stats."""
@@ -104,13 +132,7 @@ def split_dataset(
     logger.info(f"Loaded {len(df):,} rows from {input_path}")
 
     if max_rows and max_rows < len(df):
-        total = len(df)
-        parts = []
-        for rel, grp in df.groupby("display_relation"):
-            n = max(1, int(max_rows * len(grp) / total))
-            parts.append(grp.sample(n=min(n, len(grp)), random_state=seed))
-        df = pd.concat(parts, ignore_index=True)
-        logger.info(f"Sampled to {len(df):,} rows (--max-rows {max_rows})")
+        df = _drug_aware_sample(df, max_rows, seed)
 
     relations = sorted(df["display_relation"].unique())
     logger.info(f"Relations: {relations}")
@@ -123,38 +145,51 @@ def split_dataset(
         train_rel, test_rel = entity_disjoint_split(df, rel, test_ratio, rng)
 
         test_drugs = list(test_rel["x_name"].unique())
-        drug_tiers = assign_tiers(test_drugs, rng, full_ratio, zero_ratio)
+
+        drug_triple_counts = (
+            test_rel.groupby("x_name").size().to_dict()
+        )
+        drug_tiers = assign_tiers(test_drugs, drug_triple_counts, rng, full_ratio)
 
         full_drugs = {d for d, t in drug_tiers.items() if t == "full"}
         partial_drugs = {d for d, t in drug_tiers.items() if t == "partial"}
 
         tier_train_rows = []
 
-        # Full tier: include ALL test triples; record all y_names as kg_answers
+        # Full tier: include ALL test triples in train
         if full_drugs:
             full_df = test_rel[test_rel["x_name"].isin(full_drugs)]
             tier_train_rows.append(full_df)
             for drug in full_drugs:
-                answers = sorted(full_df.loc[full_df["x_name"] == drug, "y_name"].unique().tolist())
-                tier_map.setdefault(drug, {})[rel] = {"tier": "full", "kg_answers": answers}
+                answers = sorted(
+                    full_df.loc[full_df["x_name"] == drug, "y_name"]
+                    .unique()
+                    .tolist()
+                )
+                tier_map.setdefault(drug, {})[rel] = {
+                    "tier": "full",
+                    "kg_answers": answers,
+                    "held_out_answers": [],
+                }
 
-        # Partial tier: include ~partial_include fraction; record sampled y_names
+        # Partial tier: include only a fraction; hold out the rest
         if partial_drugs:
             partial_df = test_rel[test_rel["x_name"].isin(partial_drugs)]
             partial_parts = []
             for drug, grp in partial_df.groupby("x_name"):
-                n = max(1, int(len(grp) * partial_include))
+                n = int(len(grp) * partial_include)
                 sampled = grp.sample(n=min(n, len(grp)), random_state=seed)
+                held_out = grp.drop(sampled.index)
                 partial_parts.append(sampled)
-                answers = sorted(sampled["y_name"].unique().tolist())
-                tier_map.setdefault(drug, {})[rel] = {"tier": "partial", "kg_answers": answers}
+                kg_ans = sorted(sampled["y_name"].unique().tolist())
+                held_ans = sorted(held_out["y_name"].unique().tolist())
+                tier_map.setdefault(drug, {})[rel] = {
+                    "tier": "partial",
+                    "kg_answers": kg_ans,
+                    "held_out_answers": held_ans,
+                }
             if partial_parts:
                 tier_train_rows.append(pd.concat(partial_parts, ignore_index=True))
-
-        # Zero tier: no triples included; kg_answers is empty
-        for drug, tier in drug_tiers.items():
-            if tier == "zero":
-                tier_map.setdefault(drug, {})[rel] = {"tier": "zero", "kg_answers": []}
 
         train_parts.append(train_rel)
         if tier_train_rows:
@@ -162,18 +197,13 @@ def split_dataset(
         test_parts.append(test_rel)
 
         # Stats
-        tier_counts = {"full": 0, "partial": 0, "zero": 0}
+        tier_counts = {"full": 0, "partial": 0}
         for t in drug_tiers.values():
             tier_counts[t] += 1
 
         tier_triple_counts = {
             "full": int(test_rel[test_rel["x_name"].isin(full_drugs)].shape[0]),
             "partial": int(test_rel[test_rel["x_name"].isin(partial_drugs)].shape[0]),
-            "zero": int(test_rel[
-                test_rel["x_name"].isin(
-                    {d for d, t in drug_tiers.items() if t == "zero"}
-                )
-            ].shape[0]),
         }
 
         per_relation_stats[rel] = {
@@ -183,15 +213,19 @@ def split_dataset(
             "train_drugs": len(train_rel["x_name"].unique()),
             "test_drugs": len(test_drugs),
             "tiers": {
-                "full": {"drugs": tier_counts["full"], "triples": tier_triple_counts["full"]},
-                "partial": {"drugs": tier_counts["partial"], "triples": tier_triple_counts["partial"]},
-                "zero": {"drugs": tier_counts["zero"], "triples": tier_triple_counts["zero"]},
+                "full": {
+                    "drugs": tier_counts["full"],
+                    "triples": tier_triple_counts["full"],
+                },
+                "partial": {
+                    "drugs": tier_counts["partial"],
+                    "triples": tier_triple_counts["partial"],
+                },
             },
         }
         logger.info(
             f"  {rel}: {len(train_rel)} bg-train / {len(test_rel)} test  "
-            f"tiers: full={tier_counts['full']} partial={tier_counts['partial']} "
-            f"zero={tier_counts['zero']}"
+            f"tiers: full={tier_counts['full']} partial={tier_counts['partial']}"
         )
 
     train_df = pd.concat(train_parts, ignore_index=True).drop_duplicates(
@@ -215,7 +249,6 @@ def split_dataset(
         "test_ratio_requested": test_ratio,
         "max_rows": max_rows,
         "full_ratio": full_ratio,
-        "zero_ratio": zero_ratio,
         "partial_include": partial_include,
         "input_file": str(input_path),
         "total_rows_after_sampling": len(df),
@@ -258,19 +291,13 @@ def main() -> None:
         "--max-rows",
         type=int,
         default=1000,
-        help="Cap total input rows for fast processing (default: 1000, 0=no cap)",
+        help="Cap total input rows via drug-aware sampling (default: 1000, 0=no cap)",
     )
     parser.add_argument(
         "--full-ratio",
         type=float,
-        default=0.10,
-        help="Fraction of test entities in the Full tier (default: 0.10)",
-    )
-    parser.add_argument(
-        "--zero-ratio",
-        type=float,
-        default=0.10,
-        help="Fraction of test entities in the Zero tier (default: 0.10)",
+        default=0.30,
+        help="Fraction of multi-triple test drugs in the Full tier (default: 0.30)",
     )
     parser.add_argument(
         "--partial-include",
@@ -306,7 +333,6 @@ def main() -> None:
         seed=args.seed,
         max_rows=args.max_rows or None,
         full_ratio=args.full_ratio,
-        zero_ratio=args.zero_ratio,
         partial_include=args.partial_include,
     )
 
@@ -320,8 +346,7 @@ def main() -> None:
         tiers = rs["tiers"]
         print(
             f"  {rel:25s}  bg={rs['train_background']:>5,}  test={rs['test']:>5,}  "
-            f"F={tiers['full']['drugs']} P={tiers['partial']['drugs']} "
-            f"Z={tiers['zero']['drugs']}"
+            f"F={tiers['full']['drugs']} P={tiers['partial']['drugs']}"
         )
     print(f"\nOutput dir: {args.output_dir}")
 

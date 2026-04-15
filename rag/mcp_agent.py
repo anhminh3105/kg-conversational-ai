@@ -36,6 +36,22 @@ from .prompts import load_prompt
 
 logger = logging.getLogger(__name__)
 
+_THOUGHT_RE = re.compile(r"<thought>.*?</thought>", re.DOTALL)
+_SHOW_THOUGHT = os.environ.get("SHOW_THOUGHT_BLOCKS", "").lower() in ("1", "true", "yes")
+
+
+def _strip_thought_blocks(text: str) -> str:
+    """Remove <thought>...</thought> blocks produced by some models (e.g. Gemma 4)."""
+    return _THOUGHT_RE.sub("", text).strip()
+
+
+def _clean_for_log(text: str) -> str:
+    """Prepare LLM output for verbose logging, stripping thought blocks unless enabled."""
+    if _SHOW_THOUGHT:
+        return text
+    return _strip_thought_blocks(text)
+
+
 # Patterns that indicate a placeholder or generic value in a triplet component
 _PLACEHOLDER_PATTERNS = re.compile(
     r"(?:^|[_,\s\(])"  # word boundary or triplet delimiter
@@ -222,7 +238,7 @@ class MCPAgent:
         
         for iteration in range(self.max_iterations):
             if verbose:
-                print(f"\n--- Iteration {iteration + 1} ---")
+                print(f"\n--- Iteration {iteration + 1} ---", flush=True)
             
             # Generate response
             response = self._generate(
@@ -232,7 +248,7 @@ class MCPAgent:
             )
             
             if verbose:
-                print(f"Model response: {response[:200]}...")
+                print(f"Model response: {_clean_for_log(response)[:200]}...", flush=True)
             
             # Check if model wants to call a tool
             tool_call = self._parse_tool_call(response)
@@ -244,7 +260,7 @@ class MCPAgent:
                 
                 logger.info(f"Executing tool: {tool_name}({tool_args})")
                 if verbose:
-                    print(f"Tool call: {tool_name}({json.dumps(tool_args)})")
+                    print(f"Tool call: {tool_name}({json.dumps(tool_args)})", flush=True)
                 
                 # Execute tool
                 tool_result = self.tool_handler.handle_tool_call(tool_name, tool_args)
@@ -257,7 +273,7 @@ class MCPAgent:
                 })
                 
                 if verbose:
-                    print(f"Tool result: {tool_result[:300]}...")
+                    print(f"Tool result: {tool_result[:300]}...", flush=True)
                 
                 # Add to conversation
                 messages.append({"role": "assistant", "content": response})
@@ -568,7 +584,7 @@ class MCPAgentLite:
         
         for iteration in range(self.max_iterations):
             if verbose:
-                print(f"\n--- Iteration {iteration + 1} ---")
+                print(f"\n--- Iteration {iteration + 1} ---", flush=True)
             
             # Generate response via API
             response = openai_chat_completion(
@@ -579,7 +595,7 @@ class MCPAgentLite:
             )
             
             if verbose:
-                print(f"Model response: {response[:200]}...")
+                print(f"Model response: {_clean_for_log(response)[:200]}...", flush=True)
             
             # Check for tool call
             tool_call = self._parse_tool_call(response)
@@ -589,7 +605,7 @@ class MCPAgentLite:
                 tool_args = tool_call["arguments"]
                 
                 if verbose:
-                    print(f"Tool call: {tool_name}({json.dumps(tool_args)})")
+                    print(f"Tool call: {tool_name}({json.dumps(tool_args)})", flush=True)
                 
                 # Execute tool
                 tool_result = self.tool_handler.handle_tool_call(tool_name, tool_args)
@@ -720,7 +736,7 @@ class MCPAgentWithValidation:
         agent = MCPAgentWithValidation(neo4j_store, embedder)
         result = agent.run("What awards did Einstein win?")
         
-        print(result.answer)
+        print(result.answer, flush=True)
         print(result.persisted_count)        # How many triplets were persisted
         print(result.skipped_triplets)       # Triplets the LLM decided not to persist
     """
@@ -845,19 +861,19 @@ class MCPAgentWithValidation:
             knowledge_iterations_completed = knowledge_iteration
             
             if verbose:
-                print(f"\n{'='*60}")
-                print(f"KNOWLEDGE ITERATION {knowledge_iteration}/{self.max_knowledge_iterations}")
-                print(f"{'='*60}")
+                print(f"\n{'='*60}", flush=True)
+                print(f"KNOWLEDGE ITERATION {knowledge_iteration}/{self.max_knowledge_iterations}", flush=True)
+                print(f"{'='*60}", flush=True)
             
             # ----------------------------------------------------------
             # Step 1: Search knowledge graph
             # ----------------------------------------------------------
             if verbose:
-                print(f"\n--- Iteration {knowledge_iteration}, Step 1: Searching knowledge graph ---")
+                print(f"\n--- Iteration {knowledge_iteration}, Step 1: Searching knowledge graph ---", flush=True)
             
             search_result = self.tool_handler.handle_tool_call(
                 "search_knowledge_graph",
-                {"query": query, "top_k": 10}
+                {"query": query, "top_k": 30}
             )
             search_data = json.loads(search_result)
             
@@ -865,7 +881,7 @@ class MCPAgentWithValidation:
                 "iteration": len(tool_calls_log) + 1,
                 "knowledge_iteration": knowledge_iteration,
                 "tool": "search_knowledge_graph",
-                "arguments": {"query": query, "top_k": 10},
+                "arguments": {"query": query, "top_k": 30},
                 "result": search_data,
             })
             
@@ -890,24 +906,24 @@ class MCPAgentWithValidation:
             
             if verbose:
                 num_facts = search_data.get('num_results', kg_fact_count)
-                print(f"Found {num_facts} facts from KG:")
+                print(f"Found {num_facts} facts from KG:", flush=True)
                 facts_list = search_data.get("facts", [])
                 for idx, fact_str in enumerate(existing_fact_strings[:kg_fact_count], 1):
                     score = None
                     if idx - 1 < len(facts_list):
                         score = facts_list[idx - 1].get("score")
                     score_str = f" (score: {score:.4f})" if score is not None else ""
-                    print(f"  {idx:>2}. {fact_str}{score_str}")
+                    print(f"  {idx:>2}. {fact_str}{score_str}", flush=True)
                 if carried_over_facts:
-                    print(f"  + {len(carried_over_facts)} validated facts from previous iteration(s):")
+                    print(f"  + {len(carried_over_facts)} validated facts from previous iteration(s):", flush=True)
                     for idx, fact_str in enumerate(carried_over_facts, 1):
-                        print(f"    {idx:>2}. {fact_str} [validated]")
+                        print(f"    {idx:>2}. {fact_str} [validated]", flush=True)
             
             # ----------------------------------------------------------
             # Step 2: LLM-based knowledge sufficiency assessment
             # ----------------------------------------------------------
             if verbose:
-                print(f"\n--- Iteration {knowledge_iteration}, Step 2: LLM Assessing Knowledge Sufficiency ---")
+                print(f"\n--- Iteration {knowledge_iteration}, Step 2: LLM Assessing Knowledge Sufficiency ---", flush=True)
             
             llm_assessment = self._assess_knowledge_sufficiency(
                 query, existing_fact_strings, temperature
@@ -919,17 +935,17 @@ class MCPAgentWithValidation:
                 knowledge_gap_detected = True
             
             if verbose:
-                print(f"Assessment: {llm_assessment['assessment']} (confidence: {llm_assessment['confidence']:.2f})")
+                print(f"Assessment: {llm_assessment['assessment']} (confidence: {llm_assessment['confidence']:.2f})", flush=True)
                 if knowledge_gap_detected:
-                    print(f"Missing information: {len(llm_assessment.get('missing_information', []))} items")
-                    print(f"Proposed triplets: {len(llm_assessment.get('proposed_triplets', []))}")
+                    print(f"Missing information: {len(llm_assessment.get('missing_information', []))} items", flush=True)
+                    print(f"Proposed triplets: {len(llm_assessment.get('proposed_triplets', []))}", flush=True)
             
             # ----------------------------------------------------------
             # Check if we can answer now (SUFFICIENT)
             # ----------------------------------------------------------
             if not knowledge_gap_detected:
                 if verbose:
-                    print(f"\n[Iteration {knowledge_iteration}] Knowledge is SUFFICIENT - proceeding to answer generation")
+                    print(f"\n[Iteration {knowledge_iteration}] Knowledge is SUFFICIENT - proceeding to answer generation", flush=True)
                 break
             
             # ----------------------------------------------------------
@@ -937,8 +953,36 @@ class MCPAgentWithValidation:
             # ----------------------------------------------------------
             if not self.auto_expand:
                 if verbose:
-                    print(f"\n[Iteration {knowledge_iteration}] Auto-expand disabled - proceeding to answer generation")
+                    print(f"\n[Iteration {knowledge_iteration}] Auto-expand disabled - proceeding to answer generation", flush=True)
                 break
+            
+            # Early exit: skip proposal/dedup work when validation is off.
+            # Without a validator to fill gaps, don't attempt an answer.
+            if not self.tool_handler.enable_validation:
+                if verbose:
+                    print(f"\n[Iteration {knowledge_iteration}] Knowledge INSUFFICIENT and validation disabled - skipping answer", flush=True)
+                answer = "I don't have sufficient information in the knowledge graph to answer this question.\n\nstatus: Refused"
+                return ValidatedAgentResult(
+                    answer=answer,
+                    query=query,
+                    tool_calls=tool_calls_log,
+                    iterations=len(tool_calls_log),
+                    knowledge_gap_detected=True,
+                    proposed_triplets=[],
+                    validated_triplets=[],
+                    rejected_triplets=[],
+                    persisted_count=0,
+                    new_facts_notification="",
+                    intermediate_messages=intermediate_messages,
+                    llm_assessment=llm_assessment,
+                    validation_failed=False,
+                    validation_attempts=0,
+                    validation_history=[],
+                    knowledge_iterations=knowledge_iterations_completed,
+                    remote_model_name="",
+                    persistence_justification={},
+                    skipped_triplets=[],
+                )
             
             proposed_triplets = llm_assessment.get("proposed_triplets", [])
             
@@ -953,7 +997,6 @@ class MCPAgentWithValidation:
                         normalized = normalize_triplet_string(triplet_str)
                         if normalized not in all_known_fact_strings:
                             unique_triplets.append(triplet)
-                            # Add to known facts to prevent re-proposing in future iterations
                             all_known_fact_strings.add(normalized)
                         else:
                             logger.info(f"Skipping duplicate triplet (already known): {triplet}")
@@ -961,32 +1004,21 @@ class MCPAgentWithValidation:
                 proposed_triplets = unique_triplets
                 
                 if verbose and original_count != len(proposed_triplets):
-                    print(f"  Filtered out {original_count - len(proposed_triplets)} duplicate triplets")
+                    print(f"  Filtered out {original_count - len(proposed_triplets)} duplicate triplets", flush=True)
                 
                 llm_assessment["proposed_triplets"] = proposed_triplets
             
-            # If no new triplets to propose, we can't make progress
             if not proposed_triplets:
                 if verbose:
-                    print(f"\n[Iteration {knowledge_iteration}] No new triplets to propose - proceeding to answer generation")
+                    print(f"\n[Iteration {knowledge_iteration}] No new triplets to propose - proceeding to answer generation", flush=True)
                 break
             
-            # Track all proposed triplets
             all_proposed_triplets.extend([str(t) for t in proposed_triplets])
             
-            # Generate and show gap detection message
             gap_message = self._generate_gap_detection_message(llm_assessment)
             intermediate_messages.append(gap_message)
             if verbose:
-                print(gap_message)
-            
-            # ----------------------------------------------------------
-            # Step 4: Validate with retry mechanism
-            # ----------------------------------------------------------
-            if not self.tool_handler.enable_validation:
-                if verbose:
-                    print(f"\n[Iteration {knowledge_iteration}] Validation disabled - proceeding to answer generation")
-                break
+                print(gap_message, flush=True)
             
             validated_triplets, success, failure_msg, validation_history, iter_remote_model = self._validate_with_retry(
                 query=query,
@@ -1018,7 +1050,7 @@ class MCPAgentWithValidation:
                 # All validation attempts failed for this iteration
                 validation_failed = True
                 if verbose:
-                    print(f"\n[Iteration {knowledge_iteration}] Validation failed - proceeding to answer generation")
+                    print(f"\n[Iteration {knowledge_iteration}] Validation failed - proceeding to answer generation", flush=True)
                 break
             
             # ----------------------------------------------------------
@@ -1036,14 +1068,14 @@ class MCPAgentWithValidation:
             # If no triplets were validated, we can't make progress
             if not validated_triplets:
                 if verbose:
-                    print(f"\n[Iteration {knowledge_iteration}] No triplets validated - cannot make progress")
+                    print(f"\n[Iteration {knowledge_iteration}] No triplets validated - cannot make progress", flush=True)
                 break
             
             # ----------------------------------------------------------
             # Step 6: Re-assess sufficiency with validated facts included
             # ----------------------------------------------------------
             if verbose:
-                print(f"\n--- Iteration {knowledge_iteration}, Step 3: Re-assessing with {len(validated_triplets)} validated facts included ---")
+                print(f"\n--- Iteration {knowledge_iteration}, Step 3: Re-assessing with {len(validated_triplets)} validated facts included ---", flush=True)
             
             re_assessment = self._assess_knowledge_sufficiency(
                 query, existing_fact_strings, temperature
@@ -1052,7 +1084,7 @@ class MCPAgentWithValidation:
             re_sufficient = re_assessment["assessment"] != "INSUFFICIENT"
             
             if verbose:
-                print(f"Re-assessment: {re_assessment['assessment']} (confidence: {re_assessment['confidence']:.2f})")
+                print(f"Re-assessment: {re_assessment['assessment']} (confidence: {re_assessment['confidence']:.2f})", flush=True)
             
             # Generate iteration summary
             will_continue = not re_sufficient and knowledge_iteration < self.max_knowledge_iterations
@@ -1067,13 +1099,13 @@ class MCPAgentWithValidation:
             )
             intermediate_messages.append(iteration_summary)
             if verbose:
-                print(iteration_summary)
+                print(iteration_summary, flush=True)
             
             # If re-assessment says sufficient, we're done
             if re_sufficient:
                 knowledge_gap_detected = False
                 if verbose:
-                    print(f"\n[Iteration {knowledge_iteration}] Knowledge now SUFFICIENT after validation - proceeding to answer generation")
+                    print(f"\n[Iteration {knowledge_iteration}] Knowledge now SUFFICIENT after validation - proceeding to answer generation", flush=True)
                 break
             
             # Check if the re-assessment proposed new non-duplicate triplets
@@ -1088,19 +1120,19 @@ class MCPAgentWithValidation:
             
             if not new_re_proposed:
                 if verbose:
-                    print(f"\n[Iteration {knowledge_iteration}] No new triplets to propose after re-assessment - proceeding to answer generation")
+                    print(f"\n[Iteration {knowledge_iteration}] No new triplets to propose after re-assessment - proceeding to answer generation", flush=True)
                 break
             
             if verbose:
-                print(f"\n[Iteration {knowledge_iteration}] Re-assessment found {len(new_re_proposed)} new triplets to try in next iteration")
+                print(f"\n[Iteration {knowledge_iteration}] Re-assessment found {len(new_re_proposed)} new triplets to try in next iteration", flush=True)
         
         # ============================================================
         # GENERATE FINAL ANSWER
         # ============================================================
         if verbose:
-            print(f"\n{'='*60}")
-            print(f"GENERATING FINAL ANSWER (after {knowledge_iterations_completed} iteration(s))")
-            print(f"{'='*60}")
+            print(f"\n{'='*60}", flush=True)
+            print(f"GENERATING FINAL ANSWER (after {knowledge_iterations_completed} iteration(s))", flush=True)
+            print(f"{'='*60}", flush=True)
         
         # Build final facts: existing KG facts + validated (not-yet-persisted) triplets
         validated_fact_set: set[str] = set()
@@ -1157,7 +1189,7 @@ Answer the question naturally based on these facts. Ignore any facts with placeh
         )
         
         if verbose:
-            print(f"\nFinal answer: {answer[:200]}...")
+            print(f"\nFinal answer: {_clean_for_log(answer)[:200]}...", flush=True)
         
         # ============================================================
         # PERSISTENCE JUSTIFICATION & EXECUTION (after answer)
@@ -1167,9 +1199,9 @@ Answer the question naturally based on these facts. Ignore any facts with placeh
         
         if all_validated_triplets:
             if verbose:
-                print(f"\n{'='*60}")
-                print(f"PERSISTENCE JUSTIFICATION")
-                print(f"{'='*60}")
+                print(f"\n{'='*60}", flush=True)
+                print(f"PERSISTENCE JUSTIFICATION", flush=True)
+                print(f"{'='*60}", flush=True)
             
             # Ask local LLM whether each validated triplet should be persisted
             persistence_justification = self._justify_persistence(
@@ -1183,12 +1215,12 @@ Answer the question naturally based on these facts. Ignore any facts with placeh
             skipped_triplets = persistence_justification.get("skip", [])
             
             if verbose:
-                print(f"  Persist: {len(triplets_to_persist)} triplets")
+                print(f"  Persist: {len(triplets_to_persist)} triplets", flush=True)
                 for tp in triplets_to_persist:
-                    print(f"    + {tp.get('triplet', '')} - {tp.get('reason', '')}")
-                print(f"  Skip: {len(skipped_triplets)} triplets")
+                    print(f"    + {tp.get('triplet', '')} - {tp.get('reason', '')}", flush=True)
+                print(f"  Skip: {len(skipped_triplets)} triplets", flush=True)
                 for sk in skipped_triplets:
-                    print(f"    - {sk.get('triplet', '')} - {sk.get('reason', '')}")
+                    print(f"    - {sk.get('triplet', '')} - {sk.get('reason', '')}", flush=True)
             
             # Persist only the justified triplets
             if triplets_to_persist:
@@ -1214,7 +1246,7 @@ Answer the question naturally based on these facts. Ignore any facts with placeh
                 })
                 
                 if verbose:
-                    print(f"\n  Persisted {total_persisted_count} triplets to Neo4j")
+                    print(f"\n  Persisted {total_persisted_count} triplets to Neo4j", flush=True)
         
         return ValidatedAgentResult(
             answer=answer,
@@ -1254,9 +1286,16 @@ Answer the question naturally based on these facts. Ignore any facts with placeh
             )
         return load_prompt("answer_generation")
     
-    def _get_assessment_prompt(self) -> str:
-        """Return the system prompt for knowledge assessment."""
-        return load_prompt("knowledge_assessment")
+    def _get_assessment_prompt(self, enable_validation: bool = True) -> str:
+        """Return the system prompt for knowledge assessment.
+        
+        When validation is disabled, uses a simpler prompt that only checks
+        whether retrieved facts are relevant (not whether they are complete
+        relative to the LLM's own knowledge).
+        """
+        if enable_validation:
+            return load_prompt("knowledge_assessment")
+        return load_prompt("knowledge_assessment_no_validation")
     
     def _assess_knowledge_sufficiency(
         self,
@@ -1277,7 +1316,9 @@ Answer the question naturally based on these facts. Ignore any facts with placeh
         """
         from .edc.edc.utils.llm_utils import openai_chat_completion
         
-        system_prompt = self._get_assessment_prompt()
+        system_prompt = self._get_assessment_prompt(
+            enable_validation=self.tool_handler.enable_validation
+        )
         
         facts_text = "\n".join(f"- {f}" for f in facts) if facts else "No facts available."
         
@@ -1326,7 +1367,9 @@ Analyze these facts and respond with the JSON assessment."""
         }
         
         try:
-            # Try to extract JSON from markdown code blocks
+            # Strip thought blocks before parsing
+            clean_response = _strip_thought_blocks(response)
+            
             json_patterns = [
                 r'```json\s*(\{[\s\S]*?\})\s*```',
                 r'```\s*(\{[\s\S]*?\})\s*```',
@@ -1335,14 +1378,13 @@ Analyze these facts and respond with the JSON assessment."""
             
             json_str = None
             for pattern in json_patterns:
-                match = re.search(pattern, response, re.DOTALL)
+                match = re.search(pattern, clean_response, re.DOTALL)
                 if match:
                     json_str = match.group(1)
                     break
             
             if not json_str:
-                # Try to parse the entire response as JSON
-                json_str = response.strip()
+                json_str = clean_response.strip()
             
             # Parse JSON
             data = json.loads(json_str)
@@ -1966,7 +2008,7 @@ For each triplet above, decide whether to persist or skip. Do NOT add any triple
             )
             intermediate_messages.append(attempt_message)
             if verbose:
-                print(attempt_message)
+                print(attempt_message, flush=True)
             
             # Record in history
             validation_history.append({
@@ -2004,13 +2046,13 @@ For each triplet above, decide whether to persist or skip. Do NOT add any triple
                 )
                 intermediate_messages.append(retry_message)
                 if verbose:
-                    print(retry_message)
+                    print(retry_message, flush=True)
         
         # All retries exhausted
         failure_message = self._generate_failure_message(query, max_retries)
         intermediate_messages.append(failure_message)
         if verbose:
-            print(failure_message)
+            print(failure_message, flush=True)
         
         return [], False, failure_message, validation_history, remote_model_name
 
@@ -2139,7 +2181,7 @@ if __name__ == "__main__":
     print(f"Tool calls: {len(result.tool_calls)}")
     
     for tc in result.tool_calls:
-        print(f"  - {tc['tool']}({tc['arguments']})")
+        print(f"  - {tc['tool']}({tc['arguments']})", flush=True)
     
     if result.warning:
-        print(f"Warning: {result.warning}")
+        print(f"Warning: {result.warning}", flush=True)

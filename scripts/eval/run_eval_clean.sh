@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# End-to-end evaluation pipeline: data splitting -> QA generation -> evaluation
+# Neo4j clear + evaluation only (no CSV download, split, or QA generation).
+# Expects existing train split and QA dataset under the eval directory.
 #
 # Runs two configs by default:
 #   without-validation  – Agent without remote LLM validation
 #   with-validation     – Agent with remote LLM validation (propose + fact-check)
 #
 # Usage:
-#   bash scripts/eval/run_eval_pipeline.sh
-#   bash scripts/eval/run_eval_pipeline.sh --max-rows 500
-#   bash scripts/eval/run_eval_pipeline.sh --skip-qa-gen
-#   bash scripts/eval/run_eval_pipeline.sh --configs "without-validation"
+#   bash scripts/eval/run_eval_clean.sh
+#   bash scripts/eval/run_eval_clean.sh --configs "without-validation"
+#   bash scripts/eval/run_eval_clean.sh --eval-dir data/eval --qa-dataset data/eval/qa_dataset.json
 #
 set -euo pipefail
 
@@ -19,26 +19,28 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-MAX_ROWS="${MAX_ROWS:-1000}"
 NEO4J_HOME="${NEO4J_HOME:-$HOME/tools/neo4j-community-5.26.0}"
 NEO4J_URI="${NEO4J_URI:-bolt://localhost:7687}"
 NEO4J_PASSWORD="${NEO4J_PASSWORD:-password123}"
 EVAL_DIR="data/eval"
 CONFIGS="without-validation with-validation"
-SKIP_QA_GEN=0
+QA_DATASET=""
 export SHOW_THOUGHT_BLOCKS="${SHOW_THOUGHT_BLOCKS:-false}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --max-rows) MAX_ROWS="$2"; shift 2 ;;
-        --skip-qa-gen) SKIP_QA_GEN=1; shift ;;
         --configs) CONFIGS="$2"; shift 2 ;;
+        --eval-dir) EVAL_DIR="$2"; shift 2 ;;
+        --qa-dataset) QA_DATASET="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
+if [[ -z "$QA_DATASET" ]]; then
+    QA_DATASET="$EVAL_DIR/qa_dataset.json"
+fi
+
 log() { echo -e "\n\033[1;36m==> $1\033[0m"; }
-warn() { echo -e "\033[1;33mWARN: $1\033[0m"; }
 fail() { echo -e "\033[1;31mERROR: $1\033[0m"; exit 1; }
 
 # ── 1. Check prerequisites ───────────────────────────────────────────────────
@@ -49,6 +51,14 @@ if ! command -v python &>/dev/null; then
 fi
 
 python -c "import pandas, numpy" 2>/dev/null || fail "Missing Python deps: pip install pandas numpy"
+
+TRAIN_CSV="$EVAL_DIR/train.csv"
+if [[ ! -f "$TRAIN_CSV" ]]; then
+    fail "Missing $TRAIN_CSV — run the full pipeline or split/import first."
+fi
+if [[ ! -f "$QA_DATASET" ]]; then
+    fail "Missing QA dataset: $QA_DATASET — generate it or pass --qa-dataset."
+fi
 
 # Neo4j check
 check_neo4j() {
@@ -97,81 +107,39 @@ if [[ -z "${USE_LOCAL_LLM:-}" && -z "${OPENAI_API_KEY:-}" && -z "${OPENAI_KEY:-}
 fi
 echo "LLM env: OK (USE_LOCAL_LLM=${USE_LOCAL_LLM:-unset}, PRIMARY=${OPENAI_MODEL:-unset}, VALIDATION=${REMOTE_LLM_MODEL:-unset})"
 
-# ── 2. Data preparation ─────────────────────────────────────────────────────
-log "Step 1: Ensuring drug-disease CSV exists"
+QA_COUNT=$(python -c "import json, sys; print(len(json.load(open(sys.argv[1]))))" "$QA_DATASET")
+echo "Eval dir: $EVAL_DIR"
+echo "Train CSV: $TRAIN_CSV ($(wc -l < "$TRAIN_CSV") lines)"
+echo "QA dataset: $QA_DATASET ($QA_COUNT questions)"
 
-INPUT_CSV="data/kg_drug_disease.csv"
-if [[ ! -f "$INPUT_CSV" ]]; then
-    log "Downloading PrimeKG drug-disease subset"
-    python scripts/download_primekb.py --skip_summary
-fi
-
-if [[ ! -f "$INPUT_CSV" ]]; then
-    fail "Expected $INPUT_CSV after download, but it does not exist."
-fi
-echo "Input: $INPUT_CSV ($(wc -l < "$INPUT_CSV") lines)"
-
-# ── 3. Split with tiers ─────────────────────────────────────────────────────
-log "Step 2: Splitting data with tier assignment (max_rows=$MAX_ROWS)"
-
-python scripts/eval/split_primekb.py \
-    --input "$INPUT_CSV" \
-    --output-dir "$EVAL_DIR" \
-    --max-rows "$MAX_ROWS"
-
-echo "Train: $(wc -l < "$EVAL_DIR/train.csv") lines"
-echo "Test:  $(wc -l < "$EVAL_DIR/test.csv") lines"
-
-if [[ ! -f "$EVAL_DIR/tier_assignments.json" ]]; then
-    fail "tier_assignments.json not created by split script"
-fi
-
-# ── 4. QA generation ────────────────────────────────────────────────────────
-if [[ "$SKIP_QA_GEN" -eq 1 && -f "$EVAL_DIR/qa_dataset.json" ]]; then
-    log "Step 3: Skipping QA generation (--skip-qa-gen, using existing dataset)"
-else
-    log "Step 3: Generating QA dataset from test split"
-    python scripts/eval/generate_qa.py \
-        --test-csv "$EVAL_DIR/test.csv" \
-        --output "$EVAL_DIR/qa_dataset.json" \
-        --no-cache
-fi
-
-QA_COUNT=$(python -c "import json; print(len(json.load(open('$EVAL_DIR/qa_dataset.json'))))")
-echo "QA dataset: $QA_COUNT questions"
-
-# ── 5. Import into Neo4j & evaluate ─────────────────────────────────────────
-log "Step 4: Importing train.csv into Neo4j (with --clear)"
+# ── 2. Import into Neo4j (clear) ──────────────────────────────────────────────
+log "Importing train.csv into Neo4j (with --clear)"
 
 python scripts/import_primekb_to_neo4j.py \
-    --input "$EVAL_DIR/train.csv" \
+    --input "$TRAIN_CSV" \
     --uri "$NEO4J_URI" \
     --password "$NEO4J_PASSWORD" \
     --clear
 
-# ── 6. Run evaluation ───────────────────────────────────────────────────────
-log "Step 5: Running evaluation (configs: $CONFIGS)"
+# ── 3. Run evaluation ─────────────────────────────────────────────────────────
+log "Running evaluation (configs: $CONFIGS)"
 
 python scripts/eval/evaluate.py \
-    --qa-dataset "$EVAL_DIR/qa_dataset.json" \
+    --qa-dataset "$QA_DATASET" \
     --configs $CONFIGS \
     --output-dir "$EVAL_DIR" \
     --neo4j-uri "$NEO4J_URI" \
     --neo4j-password "$NEO4J_PASSWORD" \
     --verbose
 
-# ── 7. Summary ──────────────────────────────────────────────────────────────
-log "Pipeline complete"
+# ── 4. Summary ────────────────────────────────────────────────────────────────
+log "Neo4j clear + evaluation complete"
 echo ""
 echo "Output files:"
-echo "  $EVAL_DIR/train.csv              - KG data loaded into Neo4j"
-echo "  $EVAL_DIR/test.csv               - Test triples"
-echo "  $EVAL_DIR/tier_assignments.json   - Entity tier mapping"
-echo "  $EVAL_DIR/qa_dataset.json         - QA dataset with tier tags"
 echo "  $EVAL_DIR/eval_N*_*.json         - Full evaluation report (timestamped)"
 echo ""
-echo "To re-run evaluation only (skip data prep):"
-echo "  python scripts/eval/evaluate.py --configs $CONFIGS --verbose"
+echo "Split / QA generation were not run. To re-run evaluation only (no Neo4j reload):"
+echo "  python scripts/eval/evaluate.py --qa-dataset \"$QA_DATASET\" --configs $CONFIGS --verbose"
 echo ""
 echo "Environment:"
 echo "  SHOW_THOUGHT_BLOCKS=$SHOW_THOUGHT_BLOCKS  (set to 'true' to show <thought> blocks in logs)"

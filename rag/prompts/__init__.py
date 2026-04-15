@@ -32,6 +32,7 @@ PROMPT_NAMES = {
     "answer_generation": "Prompt for generating answers from facts",
     "answer_generation_with_new_facts": "Answer prompt noting new validated facts",
     "knowledge_assessment": "Prompt for assessing knowledge sufficiency",
+    "knowledge_assessment_no_validation": "Simpler assessment prompt when validation is disabled",
     "triplet_reproposal": "Prompt for re-proposing rejected triplets",
     "triplet_validation": "Prompt for validating proposed triplets",
     "persistence_justification": "Prompt for local LLM to decide which triplets to persist",

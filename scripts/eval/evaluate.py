@@ -8,7 +8,7 @@ All configs use Neo4j as the knowledge store.
     without-validation   – Agent without remote LLM validation
     with-validation      – Agent with remote LLM validation (propose + fact-check)
 
-Metrics: Exact Match, KG Recall, Answer Rate, Hallucination Proxy, Latency.
+Metrics: Gold Recall, Answer Rate, Hallucination Proxy, Latency.
 
 Prerequisites:
     source export_local_qwen3.sh   # or export_google_ai.sh
@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 # QA Judger – scoring helpers
 # ---------------------------------------------------------------------------
 
-_STATUS_LINE_RE = re.compile(r"\nstatus:\s*(accepted|refused)\s*$", re.IGNORECASE)
+_STATUS_LINE_RE = re.compile(r"^status:\s*(accepted|refused)\s*$", re.IGNORECASE | re.MULTILINE)
+_THOUGHT_RE = re.compile(r"<thought>.*?</thought>", re.DOTALL)
 
 _QUALIFIER_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
@@ -54,8 +55,14 @@ class FormatError(Exception):
     """Raised when the LLM answer is missing the required status line."""
 
 
+def _strip_thought_blocks(text: str) -> str:
+    """Remove <thought>...</thought> blocks produced by some models (e.g. Gemma 4)."""
+    return _THOUGHT_RE.sub("", text).strip()
+
+
 def _strip_status_line(text: str) -> str:
-    """Remove the trailing 'status: …' line and clean special characters."""
+    """Remove 'status: …' line and clean special characters."""
+    text = _strip_thought_blocks(text)
     text = _STATUS_LINE_RE.sub("", text)
     text = re.sub(r"[\n\r\t]+", " ", text)
     text = re.sub(r"\s*[-*•]\s+", " ", text)
@@ -104,35 +111,24 @@ class QAJudger:
     """Stateless scorer for a single QA pair."""
 
     @staticmethod
-    def exact_match(prediction: str, gold_answers: list[str]) -> bool:
-        pred_clean = _strip_non_alnum(prediction).lower()
-        return any(
-            _strip_non_alnum(_normalize(g)).lower() in pred_clean
-            for g in gold_answers
-        )
-
-    @staticmethod
-    def is_refusal(prediction: str) -> bool:
-        last_line = prediction.strip().rsplit("\n", 1)[-1].strip().lower()
-        if last_line == "status: refused":
-            return True
-        if last_line == "status: accepted":
-            return False
-
-        raise FormatError(f"Missing status line (last line: {last_line!r})")
-
-
-    @staticmethod
-    def kg_recall(prediction: str, kg_answers: list[str]) -> float:
-        """Fraction of KG-available gold answers found in prediction."""
-        if not kg_answers:
+    def gold_recall(prediction: str, gold_answers: list[str]) -> float:
+        """Fraction of ALL gold answers found in the prediction."""
+        if not gold_answers:
             return 0.0
         pred_clean = _strip_non_alnum(prediction).lower()
         found = sum(
-            1 for a in kg_answers
+            1 for a in gold_answers
             if _strip_non_alnum(_normalize(a)).lower() in pred_clean
         )
-        return found / len(kg_answers)
+        return found / len(gold_answers)
+
+    @staticmethod
+    def is_refusal(prediction: str) -> bool:
+        clean = _strip_thought_blocks(prediction).strip()
+        match = _STATUS_LINE_RE.search(clean)
+        if match:
+            return match.group(1).lower() == "refused"
+        raise FormatError(f"Missing status line in response")
 
     @staticmethod
     def hallucination_score(
@@ -184,8 +180,7 @@ class QuestionResult:
     gold_answers: list[str]
     tier: str = "partial"
     prediction: str = ""
-    exact_match: bool = False
-    kg_recall: float = 0.0
+    gold_recall: float = 0.0
     kg_answers: list[str] = field(default_factory=list)
     is_refusal: bool = False
     hallucination: float = 0.0
@@ -271,8 +266,7 @@ def _run_rag(
                 f"{s} {p} {o}" for s, p, o in gen.sources
             ]
             qr.retrieved_facts = retrieved_strs
-            qr.exact_match = judger.exact_match(qr.prediction, q["gold_answers"])
-            qr.kg_recall = judger.kg_recall(qr.prediction, q_kg_answers)
+            qr.gold_recall = judger.gold_recall(qr.prediction, q["gold_answers"])
             qr.hallucination = judger.hallucination_score(
                 qr.prediction, q["gold_answers"], q_kg_answers, retrieved_strs
             )
@@ -349,8 +343,7 @@ def _run_agent(
                     if tc.get("tool") in ("search_knowledge", "search_knowledge_graph")
                 ]
                 qr.retrieved_facts = retrieved_strs
-                qr.exact_match = judger.exact_match(qr.prediction, q["gold_answers"])
-                qr.kg_recall = judger.kg_recall(qr.prediction, q_kg_answers)
+                qr.gold_recall = judger.gold_recall(qr.prediction, q["gold_answers"])
                 qr.hallucination = judger.hallucination_score(
                     qr.prediction, q["gold_answers"], q_kg_answers, retrieved_strs
                 )
@@ -389,10 +382,11 @@ def _print_progress(config: str, idx: int, total: int, qr: QuestionResult) -> No
     elif qr.error:
         tag = "ERR"
     else:
-        tag = "EM=Y" if qr.exact_match else "EM=N"
+        tag = f"GR={qr.gold_recall:.2f}"
     print(
         f"  [{config}] {idx}/{total}  {tag}  "
-        f"lat={qr.latency_s:.1f}s  {qr.question[:60]}"
+        f"lat={qr.latency_s:.1f}s  {qr.question[:60]}",
+        flush=True,
     )
 
 
@@ -419,14 +413,12 @@ def _aggregate(results: list[QuestionResult]) -> dict[str, Any]:
                 "errors": errors, "format_failures": len(fmt_fails),
             }
         answered = [r for r in valid if not r.is_refusal]
-        with_kg = [r for r in valid if r.kg_answers]
         m = {
             "count": n,
             "scored_count": n_valid,
-            "exact_match": round(sum(r.exact_match for r in valid) / n_valid, 4),
-            "kg_recall_mean": round(
-                sum(r.kg_recall for r in with_kg) / len(with_kg), 4
-            ) if with_kg else 0.0,
+            "gold_recall_mean": round(
+                sum(r.gold_recall for r in valid) / n_valid, 4
+            ),
             "answer_rate": round(len(answered) / n_valid, 4),
             "hallucination_mean": round(
                 sum(r.hallucination for r in valid) / n_valid, 4
@@ -478,7 +470,7 @@ _CONFIG_SHORT = {
 def _build_output_path(output_dir: str, num_questions: int,
                        split_stats: Optional[dict],
                        configs: Optional[list[str]] = None) -> str:
-    """Build a descriptive filename like eval_N84_noval_val_f10_p80_z10_20260410_153012.json"""
+    """Build a descriptive filename like eval_N84_noval_val_f30_p70_20260410_153012.json"""
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     parts = [f"eval_N{num_questions}"]
     if configs:
@@ -486,9 +478,8 @@ def _build_output_path(output_dir: str, num_questions: int,
         parts.append("_".join(cfg_tags))
     if split_stats:
         fr = round(split_stats.get("full_ratio", 0) * 100)
-        zr = round(split_stats.get("zero_ratio", 0) * 100)
-        pr = 100 - fr - zr
-        parts.append(f"f{fr}_p{pr}_z{zr}")
+        pr = 100 - fr
+        parts.append(f"f{fr}_p{pr}")
     parts.append(ts)
     return os.path.join(output_dir, "_".join(parts) + ".json")
 
@@ -625,8 +616,7 @@ def _print_summary(report: dict[str, Any]) -> None:
     print("-" * total_width)
 
     metrics = [
-        ("Exact Match", "exact_match"),
-        ("KG Recall (mean)", "kg_recall_mean"),
+        ("Gold Recall (mean)", "gold_recall_mean"),
         ("Answer Rate", "answer_rate"),
         ("Hallucination (mean)", "hallucination_mean"),
         ("Latency (s, mean)", "latency_mean_s"),
@@ -652,12 +642,12 @@ def _print_summary(report: dict[str, Any]) -> None:
         all_relations.update(by_rel.keys())
 
     if all_relations:
-        print(f"\n{'--- Per-relation Exact Match ---':^{total_width}}")
+        print(f"\n{'--- Per-relation Gold Recall ---':^{total_width}}")
         for rel in sorted(all_relations):
             row = f"  {rel:28s}"
             for c in cfg_labels:
                 by_rel = configs[c].get("aggregate", {}).get("by_relation", {})
-                val = by_rel.get(rel, {}).get("exact_match", "N/A")
+                val = by_rel.get(rel, {}).get("gold_recall_mean", "N/A")
                 if isinstance(val, float):
                     row += f"{val:>{col_width}.4f}"
                 else:
@@ -671,28 +661,14 @@ def _print_summary(report: dict[str, Any]) -> None:
         all_tiers.update(by_tier.keys())
 
     if all_tiers:
-        print(f"\n{'--- Per-tier Exact Match ---':^{total_width}}")
+        print(f"\n{'--- Per-tier Gold Recall ---':^{total_width}}")
         for tier in sorted(all_tiers):
             row = f"  {tier:28s}"
             for c in cfg_labels:
                 by_tier = configs[c].get("aggregate", {}).get("by_tier", {})
                 tier_data = by_tier.get(tier, {})
                 cnt = tier_data.get("count", 0)
-                val = tier_data.get("exact_match", "N/A")
-                if isinstance(val, float):
-                    row += f"{val:>{col_width - 5}.4f} ({cnt})"
-                else:
-                    row += f"{str(val):>{col_width}s}"
-            print(row)
-
-        print(f"\n{'--- Per-tier KG Recall ---':^{total_width}}")
-        for tier in sorted(all_tiers):
-            row = f"  {tier:28s}"
-            for c in cfg_labels:
-                by_tier = configs[c].get("aggregate", {}).get("by_tier", {})
-                tier_data = by_tier.get(tier, {})
-                cnt = tier_data.get("count", 0)
-                val = tier_data.get("kg_recall_mean", "N/A")
+                val = tier_data.get("gold_recall_mean", "N/A")
                 if isinstance(val, float):
                     row += f"{val:>{col_width - 5}.4f} ({cnt})"
                 else:
@@ -787,7 +763,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--tier",
-        choices=["all", "full", "partial", "zero"],
+        choices=["all", "full", "partial"],
         default="all",
         help="Filter questions by tier (default: all)",
     )

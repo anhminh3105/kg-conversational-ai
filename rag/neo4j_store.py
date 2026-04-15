@@ -422,6 +422,30 @@ class Neo4jStore:
             result = session.run(query, params)
             return [dict(record) for record in result]
     
+    def fuzzy_entity_search(
+        self,
+        query_text: str,
+        max_results: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Find triplets whose subject or object appears as a substring in *query_text*.
+
+        Used as a fallback when structured entity extraction fails.  The
+        direction is inverted compared to ``graph_search``: instead of
+        searching for a *known* entity name inside the graph, we check whether
+        *any* stored entity name is contained in the raw question text.
+        """
+        with self.driver.session(database=self.database) as session:
+            cypher = """
+                MATCH (t:Triplet)
+                WHERE toLower($query) CONTAINS toLower(t.subject)
+                   OR toLower($query) CONTAINS toLower(t.object)
+                RETURN t.subject AS subject, t.predicate AS predicate,
+                       t.object AS object, t.document AS document
+                LIMIT $limit
+            """
+            result = session.run(cypher, {"query": query_text, "limit": max_results})
+            return [dict(record) for record in result]
+
     def graph_expand(
         self,
         entity: str,

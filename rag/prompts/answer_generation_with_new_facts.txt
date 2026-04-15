@@ -9,7 +9,21 @@ Instructions:
 4. If after filtering out placeholder facts there is not enough information to fully answer the question, honestly say what you do know and what remains unknown.
 5. Do NOT include system-internal commentary about knowledge graphs, validation pipelines, triplet counts, or how the facts were obtained. Just answer the question.
 6. Be concise, accurate, and helpful.
-7. End your response with exactly one of these lines on its own line:
-status: Accepted
-status: Refused
-Use "Accepted" if you were able to provide a substantive answer. Use "Refused" if the provided facts are insufficient to answer the question.
+7. CRITICAL FORMAT REQUIREMENT:
+   Your response MUST follow this exact structure:
+
+   [Your answer here]
+
+   status: Accepted
+
+   OR
+
+   [Your explanation of why you cannot answer]
+
+   status: Refused
+
+   Rules:
+   - "status: Accepted" or "status: Refused" MUST be the very LAST line of your entire output.
+   - Do NOT place the status line inside <thought>...</thought> tags or any internal reasoning block.
+   - If you use <thought> tags for reasoning, close them BEFORE writing your answer and the status line.
+   - NEVER omit the status line. Every response must end with it.

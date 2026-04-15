@@ -86,6 +86,55 @@ RELATION_CONTEXT: dict[str, dict[str, str]] = {
     },
 }
 
+PARTIAL_RELATION_CONTEXT: dict[str, dict[str, str]] = {
+    "indication": {
+        "forward": (
+            "The relation is 'indication'. Generate a COMPREHENSIVE question "
+            "asking for ALL diseases or conditions the given DRUG is indicated "
+            "for. The question MUST explicitly demand a complete or exhaustive "
+            "list. Use phrasing like 'list all', 'comprehensive list of every', "
+            "'what are all the', etc. The question must mention the drug name."
+        ),
+        "reverse": (
+            "The relation is 'indication'. Generate a COMPREHENSIVE question "
+            "asking for ALL drugs that are indicated for the given DISEASE. "
+            "The question MUST explicitly demand a complete list. Use phrasing "
+            "like 'list every drug', 'all medications approved for', etc. "
+            "The question must mention the disease name."
+        ),
+    },
+    "contraindication": {
+        "forward": (
+            "The relation is 'contraindication'. Generate a COMPREHENSIVE "
+            "question asking for ALL diseases or conditions that make the "
+            "given DRUG unsafe or contraindicated. The question MUST demand "
+            "a complete/exhaustive list. Use phrasing like 'list all', "
+            "'every contraindication', etc. The question must mention the "
+            "drug name."
+        ),
+        "reverse": (
+            "The relation is 'contraindication'. Generate a COMPREHENSIVE "
+            "question asking for ALL drugs that are contraindicated for the "
+            "given DISEASE. The question MUST demand a complete list. "
+            "The question must mention the disease name."
+        ),
+    },
+    "off-label use": {
+        "forward": (
+            "The relation is 'off-label use'. Generate a COMPREHENSIVE "
+            "question asking for ALL off-label uses the given DRUG has. "
+            "The question MUST demand a complete or exhaustive list. "
+            "The question must mention the drug name."
+        ),
+        "reverse": (
+            "The relation is 'off-label use'. Generate a COMPREHENSIVE "
+            "question asking for ALL drugs that are used off-label for the "
+            "given DISEASE. The question MUST demand a complete list. "
+            "The question must mention the disease name."
+        ),
+    },
+}
+
 FALLBACK_TEMPLATES: dict[str, dict[str, str]] = {
     "indication": {
         "forward": "What conditions is {entity} indicated for?",
@@ -98,6 +147,21 @@ FALLBACK_TEMPLATES: dict[str, dict[str, str]] = {
     "off-label use": {
         "forward": "What are the off-label uses of {entity}?",
         "reverse": "Which drugs are used off-label for {entity}?",
+    },
+}
+
+PARTIAL_FALLBACK_TEMPLATES: dict[str, dict[str, str]] = {
+    "indication": {
+        "forward": "Provide a comprehensive list of ALL diseases and conditions that {entity} is indicated for.",
+        "reverse": "List every drug that is indicated for treating {entity}.",
+    },
+    "contraindication": {
+        "forward": "List ALL diseases and conditions for which {entity} is contraindicated.",
+        "reverse": "List every drug that is contraindicated for {entity}.",
+    },
+    "off-label use": {
+        "forward": "Provide a comprehensive list of ALL known off-label uses of {entity}.",
+        "reverse": "List every drug that is used off-label for {entity}.",
     },
 }
 
@@ -168,11 +232,13 @@ def _generate_questions_batch(
     entities: list[str],
     relation: str,
     direction: str,
+    context_dict: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, str]:
     """Call the LLM to generate one question per entity. Returns {entity: question}."""
     from rag.edc.edc.utils.llm_utils import openai_chat_completion
 
-    context = RELATION_CONTEXT[relation][direction]
+    ctx = context_dict or RELATION_CONTEXT
+    context = ctx[relation][direction]
     numbered = "\n".join(f"{i+1}. {e}" for i, e in enumerate(entities))
 
     user_msg = (
@@ -272,6 +338,7 @@ def _build_record(
     direction: str,
     tier: str = "partial",
     kg_answers: list[str] | None = None,
+    held_out_answers: list[str] | None = None,
 ) -> dict:
     """Build a single QA record dict (ID is assigned later)."""
     if direction == "forward":
@@ -287,6 +354,7 @@ def _build_record(
         "direction": direction,
         "tier": tier,
         "kg_answers": kg_answers if kg_answers is not None else [],
+        "held_out_answers": held_out_answers if held_out_answers is not None else [],
         "source_triplets": triplets,
     }
 
@@ -315,17 +383,22 @@ def _get_tier_info(
     tier_assignments: dict,
     entity: str,
     relation: str,
-) -> tuple[str, list[str]]:
-    """Extract tier and kg_answers for an entity+relation from assignments.
+) -> tuple[str, list[str], list[str]]:
+    """Extract tier, kg_answers, and held_out_answers for an entity+relation.
 
     Handles both old format (value is str) and new format (value is dict).
+    Returns (tier, kg_answers, held_out_answers).
     """
     entry = tier_assignments.get(entity, {}).get(relation, {})
     if isinstance(entry, str):
-        return entry, []
+        return entry, [], []
     if isinstance(entry, dict):
-        return entry.get("tier", "partial"), entry.get("kg_answers", [])
-    return "partial", []
+        return (
+            entry.get("tier", "partial"),
+            entry.get("kg_answers", []),
+            entry.get("held_out_answers", []),
+        )
+    return "partial", [], []
 
 
 def _build_questions(
@@ -393,6 +466,22 @@ def _build_questions(
             logger.warning(f"Could not resume from {output_path}: {exc}")
             records, done_keys = [], set()
 
+    # -- Pre-compute per-entity tier for routing prompts --------------------
+    def _entity_tier_for_prompt(entity: str, relation: str, direction: str) -> str:
+        """Determine which prompt set to use for an entity."""
+        if direction == "forward":
+            tier, _, _ = _get_tier_info(tier_assignments, entity, relation)
+            return tier
+        # Reverse: aggregate from contributing drugs
+        drug_list = answer_groups.get((relation, direction), {}).get(entity, [])
+        tiers = set()
+        for drug in drug_list:
+            t, _, _ = _get_tier_info(tier_assignments, drug, relation)
+            tiers.add(t)
+        if "partial" in tiers:
+            return "partial"
+        return "full"
+
     # -- Generate + build records in one pass -------------------------------
     total_entities = sum(len(v) for v in entity_lists.values())
     total_batches = sum(
@@ -428,43 +517,69 @@ def _build_questions(
             if batches_called > 0 and not _is_local_llm():
                 time.sleep(12)
 
+            # Split entities by tier so each batch uses the right prompt
+            full_ents = [e for e in uncached
+                         if _entity_tier_for_prompt(e, relation, direction) != "partial"]
+            partial_ents = [e for e in uncached
+                            if _entity_tier_for_prompt(e, relation, direction) == "partial"]
+
             logger.info(
                 f"  Batch {batch_num}/{total_batches}: "
-                f"{relation}/{direction} ({len(uncached)} entities)"
+                f"{relation}/{direction} ({len(full_ents)} full, {len(partial_ents)} partial)"
             )
 
-            generated = _generate_questions_batch(uncached, relation, direction)
-            batches_called += 1
+            generated: dict[str, str] = {}
+            if full_ents:
+                generated.update(
+                    _generate_questions_batch(full_ents, relation, direction,
+                                              context_dict=RELATION_CONTEXT)
+                )
+                batches_called += 1
+                if partial_ents and not _is_local_llm():
+                    time.sleep(12)
+            if partial_ents:
+                generated.update(
+                    _generate_questions_batch(partial_ents, relation, direction,
+                                              context_dict=PARTIAL_RELATION_CONTEXT)
+                )
+                batches_called += 1
 
             for entity in uncached:
+                entity_prompt_tier = _entity_tier_for_prompt(entity, relation, direction)
+                fb = (PARTIAL_FALLBACK_TEMPLATES if entity_prompt_tier == "partial"
+                      else FALLBACK_TEMPLATES)
+
                 if entity in generated:
                     q_text = generated[entity]
                 else:
-                    q_text = FALLBACK_TEMPLATES[relation][direction].format(
-                        entity=entity
-                    )
+                    q_text = fb[relation][direction].format(entity=entity)
                     logger.warning(
                         f"  Fallback for '{entity}' ({relation}/{direction})"
                     )
 
                 if direction == "forward":
-                    entity_tier, entity_kg = _get_tier_info(tier_assignments, entity, relation)
+                    entity_tier, entity_kg, entity_held = _get_tier_info(
+                        tier_assignments, entity, relation
+                    )
                 else:
-                    # Reverse: entity is a disease, gold_answers are drugs.
-                    # kg_answers = drugs whose (drug, relation, disease) triple is in the KG.
                     entity_kg = []
+                    entity_held = []
                     tier_labels = set()
                     for drug in golds[entity]:
-                        drug_tier, drug_kg = _get_tier_info(tier_assignments, drug, relation)
+                        drug_tier, drug_kg, drug_held = _get_tier_info(
+                            tier_assignments, drug, relation
+                        )
                         tier_labels.add(drug_tier)
                         if entity in drug_kg:
                             entity_kg.append(drug)
+                        if entity in drug_held:
+                            entity_held.append(drug)
                     if "partial" in tier_labels:
                         entity_tier = "partial"
                     elif "full" in tier_labels:
                         entity_tier = "full"
                     else:
-                        entity_tier = "zero"
+                        entity_tier = "partial"
 
                 records.append(_build_record(
                     entity=entity,
@@ -474,6 +589,7 @@ def _build_questions(
                     direction=direction,
                     tier=entity_tier,
                     kg_answers=entity_kg,
+                    held_out_answers=entity_held,
                 ))
                 done_keys.add(f"{entity}|{relation}|{direction}")
 
@@ -591,6 +707,7 @@ def main() -> None:
     from collections import Counter
     by_rel = Counter(q["relation"] for q in questions)
     by_dir = Counter(q["direction"] for q in questions)
+    by_tier = Counter(q["tier"] for q in questions)
 
     print("\n" + "=" * 50)
     print("QA generation summary")
@@ -599,12 +716,20 @@ def main() -> None:
     for rel, cnt in sorted(by_rel.items()):
         print(f"  {rel:25s}  {cnt}")
     print(f"  Forward: {by_dir['forward']}  Reverse: {by_dir['reverse']}")
+    for tier, cnt in sorted(by_tier.items()):
+        print(f"  Tier {tier:10s}: {cnt}")
     avg_answers = (
         sum(len(q["gold_answers"]) for q in questions) / len(questions)
         if questions
         else 0
     )
+    avg_held = (
+        sum(len(q.get("held_out_answers", [])) for q in questions) / len(questions)
+        if questions
+        else 0
+    )
     print(f"  Avg gold answers per question: {avg_answers:.1f}")
+    print(f"  Avg held-out answers per question: {avg_held:.1f}")
     print(f"\nOutput: {args.output}")
 
 

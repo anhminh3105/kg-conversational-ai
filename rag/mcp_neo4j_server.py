@@ -418,18 +418,32 @@ class Neo4jMCPToolHandler:
         """Fallback: extract entity names via regex heuristics."""
         import re as _re
         candidates: list[str] = []
+        skip = {"Which", "What", "Can", "Are", "How", "The", "Under",
+                "Does", "Do", "Is", "In", "For", "This", "That", "These",
+                "List", "Provide", "Give", "Name"}
+        # Pattern 1: capitalized words (drug names, proper nouns)
         for m in _re.finditer(r"\b([A-Z][a-z]+(?:\s+[a-z]+)*)\b", query):
             word = m.group(1)
-            skip = {"Which", "What", "Can", "Are", "How", "The", "Under",
-                    "Does", "Do", "Is", "In", "For", "This", "That", "These"}
             if word.split()[0] not in skip:
                 candidates.append(word)
+        # Pattern 2: lowercase phrases after common prepositions
         for m in _re.finditer(
             r"(?:of|for|is|treating|managing)\s+([a-z][a-z\s\-]+?)(?:\s+(?:in|due|with|disease)|[?.,]|$)",
             query.lower(),
         ):
             term = m.group(1).strip()
             if len(term) > 3:
+                candidates.append(term)
+        # Pattern 3: multi-word lowercase biomedical terms
+        for m in _re.finditer(
+            r"(?:^|[?.,;:]\s*|\b(?:the|a|an|for|of|with|about|in|is|are|"
+            r"treating|managing|associated|diagnosed|prescribed)\s+)"
+            r"([a-z][a-z]+(?:\s+[a-z]{3,})+)"
+            r"(?=[?.,;:\s]|$)",
+            query.lower(),
+        ):
+            term = m.group(1).strip()
+            if len(term) > 5:
                 candidates.append(term)
         return candidates
 
@@ -452,6 +466,14 @@ class Neo4jMCPToolHandler:
                 graph_triplets.extend(
                     self.store.graph_search(name, max_results=top_k)
                 )
+            except Exception:
+                pass
+
+        # --- 2b. Fuzzy fallback when entity extraction yields nothing ---
+        if not graph_triplets:
+            logger.debug("Entity extraction found no graph results, trying fuzzy search")
+            try:
+                graph_triplets = self.store.fuzzy_entity_search(query, max_results=top_k)
             except Exception:
                 pass
 
@@ -516,6 +538,8 @@ class Neo4jMCPToolHandler:
                             break
             except Exception:
                 pass
+
+        facts.sort(key=lambda f: f["score"], reverse=True)
 
         return json.dumps({
             "query": query,
