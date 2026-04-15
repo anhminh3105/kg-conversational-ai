@@ -4,11 +4,11 @@ Evaluate the KG-RAG system on the PrimeKG drug-disease QA dataset.
 
 All configs use Neo4j as the knowledge store.
 
-    Config A  – Pure RAG          (KGRagGenerator + Neo4j, no expansion)
-    Config B  – Agent, no valid.  (MCPAgentWithValidation, validation off)
-    Config C  – Full system       (MCPAgentWithValidation, validation on)
+    rag                  – Pure RAG (KGRagGenerator + Neo4j, no expansion)
+    without-validation   – Agent without remote LLM validation
+    with-validation      – Agent with remote LLM validation (propose + fact-check)
 
-Metrics: Exact Match, Token F1, Answer Rate, Hallucination Proxy, Latency.
+Metrics: Exact Match, KG Recall, Answer Rate, Hallucination Proxy, Latency.
 
 Prerequisites:
     source export_local_qwen3.sh   # or export_google_ai.sh
@@ -16,8 +16,8 @@ Prerequisites:
 
 Usage:
     python scripts/eval/evaluate.py --qa-dataset data/eval/qa_dataset.json
-    python scripts/eval/evaluate.py --qa-dataset data/eval/qa_dataset.json --configs A B
-    python scripts/eval/evaluate.py --qa-dataset data/eval/qa_dataset.json --configs C --verbose
+    python scripts/eval/evaluate.py --qa-dataset data/eval/qa_dataset.json --configs without-validation
+    python scripts/eval/evaluate.py --qa-dataset data/eval/qa_dataset.json --configs with-validation --verbose
 """
 
 import argparse
@@ -28,6 +28,8 @@ import re
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
@@ -43,15 +45,58 @@ logger = logging.getLogger(__name__)
 # QA Judger – scoring helpers
 # ---------------------------------------------------------------------------
 
-_REFUSAL_PATTERNS = re.compile(
-    r"(i don.t know|i cannot|no information|not enough|"
-    r"unable to answer|cannot determine|no relevant)",
-    re.IGNORECASE,
-)
+_STATUS_LINE_RE = re.compile(r"\nstatus:\s*(accepted|refused)\s*$", re.IGNORECASE)
+
+_QUALIFIER_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
 
-def _tokenize(text: str) -> list[str]:
-    return re.findall(r"\w+", text.lower())
+class FormatError(Exception):
+    """Raised when the LLM answer is missing the required status line."""
+
+
+def _strip_status_line(text: str) -> str:
+    """Remove the trailing 'status: …' line and clean special characters."""
+    text = _STATUS_LINE_RE.sub("", text)
+    text = re.sub(r"[\n\r\t]+", " ", text)
+    text = re.sub(r"\s*[-*•]\s+", " ", text)
+    text = re.sub(r"[()[\]{}<>]", "", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
+def _normalize(text: str) -> str:
+    """Strip trailing parenthetical qualifiers like '(disease)' for matching."""
+    return _QUALIFIER_RE.sub("", text).strip()
+
+
+def _strip_non_alnum(text: str) -> str:
+    """Remove all non-alphanumeric ASCII characters except spaces."""
+    return re.sub(r"[^a-zA-Z0-9 ]+", "", text)
+
+
+def _parse_retrieved_facts(retrieved_facts: list[str]) -> list[dict]:
+    """Parse the raw retrieved-facts strings into a flat list of fact dicts."""
+    import ast
+    facts: list[dict] = []
+    for raw in retrieved_facts:
+        try:
+            data = ast.literal_eval(raw)
+            if isinstance(data, dict):
+                facts.extend(data.get("facts", []))
+        except Exception:
+            pass
+    return facts
+
+
+def _best_retrieval_score(entity_clean: str, parsed_facts: list[dict]) -> float:
+    """Return the highest retrieval score among facts that mention *entity_clean*."""
+    best = 0.0
+    for f in parsed_facts:
+        subj = _strip_non_alnum(f.get("subject", "")).lower()
+        obj = _strip_non_alnum(f.get("object", "")).lower()
+        if entity_clean in (subj, obj):
+            best = max(best, float(f.get("score", 0)))
+    return best
 
 
 @dataclass
@@ -60,47 +105,70 @@ class QAJudger:
 
     @staticmethod
     def exact_match(prediction: str, gold_answers: list[str]) -> bool:
-        pred_lower = prediction.lower()
-        return any(g.lower() in pred_lower for g in gold_answers)
-
-    @staticmethod
-    def token_f1(prediction: str, gold_answers: list[str]) -> float:
-        pred_tokens = set(_tokenize(prediction))
-        if not pred_tokens:
-            return 0.0
-        best = 0.0
-        for gold in gold_answers:
-            gold_tokens = set(_tokenize(gold))
-            if not gold_tokens:
-                continue
-            common = pred_tokens & gold_tokens
-            if not common:
-                continue
-            precision = len(common) / len(pred_tokens)
-            recall = len(common) / len(gold_tokens)
-            f1 = 2 * precision * recall / (precision + recall)
-            best = max(best, f1)
-        return best
+        pred_clean = _strip_non_alnum(prediction).lower()
+        return any(
+            _strip_non_alnum(_normalize(g)).lower() in pred_clean
+            for g in gold_answers
+        )
 
     @staticmethod
     def is_refusal(prediction: str) -> bool:
-        return bool(_REFUSAL_PATTERNS.search(prediction)) or len(prediction.strip()) == 0
+        last_line = prediction.strip().rsplit("\n", 1)[-1].strip().lower()
+        if last_line == "status: refused":
+            return True
+        if last_line == "status: accepted":
+            return False
+
+        raise FormatError(f"Missing status line (last line: {last_line!r})")
+
+
+    @staticmethod
+    def kg_recall(prediction: str, kg_answers: list[str]) -> float:
+        """Fraction of KG-available gold answers found in prediction."""
+        if not kg_answers:
+            return 0.0
+        pred_clean = _strip_non_alnum(prediction).lower()
+        found = sum(
+            1 for a in kg_answers
+            if _strip_non_alnum(_normalize(a)).lower() in pred_clean
+        )
+        return found / len(kg_answers)
 
     @staticmethod
     def hallucination_score(
         prediction: str,
         gold_answers: list[str],
+        kg_answers: list[str],
         retrieved_facts: list[str],
+        retrieval_score_threshold: float = 0.75,
     ) -> float:
-        """Fraction of capitalised entity-like tokens not in gold or facts."""
-        pred_tokens = set(_tokenize(prediction))
-        known_tokens: set[str] = set()
-        for text in gold_answers + retrieved_facts:
-            known_tokens.update(_tokenize(text))
-        if not pred_tokens:
+        """Fraction of mentioned gold answers NOT grounded in KG.
+
+        A mentioned gold answer is grounded if it appears in *kg_answers*
+        (exact match) **or** if the entity appears in a retrieved fact whose
+        retrieval score >= *retrieval_score_threshold* (semantic grounding).
+        """
+        pred_clean = _strip_non_alnum(prediction).lower()
+        kg_set = {_strip_non_alnum(_normalize(a)).lower() for a in kg_answers}
+
+        mentioned = [
+            g for g in gold_answers
+            if _strip_non_alnum(_normalize(g)).lower() in pred_clean
+        ]
+        if not mentioned:
             return 0.0
-        novel = pred_tokens - known_tokens
-        return len(novel) / len(pred_tokens)
+
+        parsed_facts = _parse_retrieved_facts(retrieved_facts)
+
+        not_grounded = 0
+        for g in mentioned:
+            g_clean = _strip_non_alnum(_normalize(g)).lower()
+            if g_clean in kg_set:
+                continue
+            best_score = _best_retrieval_score(g_clean, parsed_facts)
+            if best_score < retrieval_score_threshold:
+                not_grounded += 1
+        return not_grounded / len(mentioned)
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +182,18 @@ class QuestionResult:
     relation: str
     direction: str
     gold_answers: list[str]
+    tier: str = "partial"
     prediction: str = ""
     exact_match: bool = False
-    token_f1: float = 0.0
+    kg_recall: float = 0.0
+    kg_answers: list[str] = field(default_factory=list)
     is_refusal: bool = False
     hallucination: float = 0.0
     latency_s: float = 0.0
     config: str = ""
-    # Agent-specific (Config B/C)
+    retrieved_facts: list[str] = field(default_factory=list)
+    format_failure: bool = False
+    # with-validation specific
     validated_triplets_count: int = 0
     rejected_triplets_count: int = 0
     persisted_count: int = 0
@@ -132,7 +204,7 @@ class QuestionResult:
 # Runner helpers
 # ---------------------------------------------------------------------------
 
-def _run_config_a(
+def _run_rag(
     questions: list[dict],
     store_type: str,
     neo4j_uri: str,
@@ -140,7 +212,7 @@ def _run_config_a(
     index_dir: str,
     verbose: bool,
 ) -> list[QuestionResult]:
-    """Config A: Pure RAG via KGRagGenerator (Neo4j or FAISS backend)."""
+    """Pure RAG via KGRagGenerator (Neo4j or FAISS backend)."""
     try:
         from rag.kg_rag_indexer import KGRagIndexer
         from rag.generator import KGRagGenerator
@@ -156,16 +228,16 @@ def _run_config_a(
     try:
         if store_type == "faiss":
             indexer = KGRagIndexer.load(index_dir)
-            logger.info(f"Config A: loaded FAISS index from {index_dir}")
+            logger.info(f"rag: loaded FAISS index from {index_dir}")
         else:
             indexer = KGRagIndexer(
                 store_type="neo4j",
                 neo4j_uri=neo4j_uri,
                 neo4j_password=neo4j_password,
             )
-            logger.info(f"Config A: connected to Neo4j at {neo4j_uri}")
+            logger.info(f"rag: connected to Neo4j at {neo4j_uri}")
     except Exception as e:
-        logger.error(f"Config A: failed to initialize {store_type} store: {e}")
+        logger.error(f"rag: failed to initialize {store_type} store: {e}")
         return []
 
     generator = KGRagGenerator(indexer)
@@ -173,13 +245,16 @@ def _run_config_a(
     results: list[QuestionResult] = []
 
     for i, q in enumerate(questions):
+        q_kg_answers = q.get("kg_answers", [])
         qr = QuestionResult(
             qid=q["id"],
             question=q["question"],
             relation=q["relation"],
             direction=q["direction"],
             gold_answers=q["gold_answers"],
-            config="A",
+            tier=q.get("tier", "partial"),
+            kg_answers=q_kg_answers,
+            config="rag",
         )
         try:
             t0 = time.time()
@@ -189,37 +264,38 @@ def _run_config_a(
                 expand_triplets=False,
             )
             qr.latency_s = time.time() - t0
-            qr.prediction = gen.answer
+            qr.is_refusal = judger.is_refusal(gen.answer)
+            qr.prediction = _strip_status_line(gen.answer)
 
             retrieved_strs = [
                 f"{s} {p} {o}" for s, p, o in gen.sources
             ]
-            qr.exact_match = judger.exact_match(gen.answer, q["gold_answers"])
-            qr.token_f1 = judger.token_f1(gen.answer, q["gold_answers"])
-            qr.is_refusal = judger.is_refusal(gen.answer)
+            qr.retrieved_facts = retrieved_strs
+            qr.exact_match = judger.exact_match(qr.prediction, q["gold_answers"])
+            qr.kg_recall = judger.kg_recall(qr.prediction, q_kg_answers)
             qr.hallucination = judger.hallucination_score(
-                gen.answer, q["gold_answers"], retrieved_strs
+                qr.prediction, q["gold_answers"], q_kg_answers, retrieved_strs
             )
         except Exception as e:
             qr.error = str(e)
-            logger.warning(f"Config A q={q['id']}: {e}")
+            logger.warning(f"rag q={q['id']}: {e}")
 
         results.append(qr)
         if verbose:
-            _print_progress("A", i + 1, len(questions), qr)
+            _print_progress("rag", i + 1, len(questions), qr)
 
     return results
 
 
-def _run_config_bc(
+def _run_agent(
     questions: list[dict],
     enable_validation: bool,
     neo4j_uri: str,
     neo4j_password: str,
     verbose: bool,
 ) -> list[QuestionResult]:
-    """Config B or C via MCPAgentWithValidation."""
-    config_label = "C" if enable_validation else "B"
+    """Agent runner, with or without remote LLM validation."""
+    config_label = "with-validation" if enable_validation else "without-validation"
     try:
         from rag.mcp_agent import create_mcp_agent_with_validation
     except Exception as e:
@@ -239,44 +315,66 @@ def _run_config_bc(
             auto_expand=True,
         )
     except Exception as e:
-        logger.error(f"Config {config_label}: failed to create agent: {e}")
+        logger.error(f"{config_label}: failed to create agent: {e}")
         return []
 
     judger = QAJudger()
     results: list[QuestionResult] = []
+    max_format_retries = 3
 
     for i, q in enumerate(questions):
+        q_kg_answers = q.get("kg_answers", [])
         qr = QuestionResult(
             qid=q["id"],
             question=q["question"],
             relation=q["relation"],
             direction=q["direction"],
             gold_answers=q["gold_answers"],
+            tier=q.get("tier", "partial"),
+            kg_answers=q_kg_answers,
             config=config_label,
         )
-        try:
-            t0 = time.time()
-            res = agent.run(query=q["question"], verbose=verbose)
-            qr.latency_s = time.time() - t0
-            qr.prediction = res.answer
 
-            retrieved_strs = [
-                str(tc.get("result", ""))
-                for tc in res.tool_calls
-                if tc.get("tool") in ("search_knowledge", "search_knowledge_graph")
-            ]
-            qr.exact_match = judger.exact_match(res.answer, q["gold_answers"])
-            qr.token_f1 = judger.token_f1(res.answer, q["gold_answers"])
-            qr.is_refusal = judger.is_refusal(res.answer)
-            qr.hallucination = judger.hallucination_score(
-                res.answer, q["gold_answers"], retrieved_strs
-            )
-            qr.validated_triplets_count = len(getattr(res, "validated_triplets", []))
-            qr.rejected_triplets_count = len(getattr(res, "rejected_triplets", []))
-            qr.persisted_count = getattr(res, "persisted_count", 0)
-        except Exception as e:
-            qr.error = str(e)
-            logger.warning(f"Config {config_label} q={q['id']}: {e}")
+        for attempt in range(1, max_format_retries + 1):
+            try:
+                t0 = time.time()
+                res = agent.run(query=q["question"], verbose=verbose)
+                qr.latency_s = time.time() - t0
+                qr.is_refusal = judger.is_refusal(res.answer)
+                qr.prediction = _strip_status_line(res.answer)
+
+                retrieved_strs = [
+                    str(tc.get("result", ""))
+                    for tc in res.tool_calls
+                    if tc.get("tool") in ("search_knowledge", "search_knowledge_graph")
+                ]
+                qr.retrieved_facts = retrieved_strs
+                qr.exact_match = judger.exact_match(qr.prediction, q["gold_answers"])
+                qr.kg_recall = judger.kg_recall(qr.prediction, q_kg_answers)
+                qr.hallucination = judger.hallucination_score(
+                    qr.prediction, q["gold_answers"], q_kg_answers, retrieved_strs
+                )
+                qr.validated_triplets_count = len(getattr(res, "validated_triplets", []))
+                qr.rejected_triplets_count = len(getattr(res, "rejected_triplets", []))
+                qr.persisted_count = getattr(res, "persisted_count", 0)
+                break
+            except FormatError as e:
+                if attempt < max_format_retries:
+                    logger.warning(
+                        f"{config_label} q={q['id']}: attempt {attempt}/{max_format_retries} "
+                        f"- {e}, retrying..."
+                    )
+                    continue
+                qr.format_failure = True
+                qr.prediction = _strip_status_line(res.answer)
+                logger.warning(
+                    f"{config_label} q={q['id']}: format failure after "
+                    f"{max_format_retries} attempts - skipping scoring"
+                )
+            except Exception as e:
+                qr.error = str(e)
+                logger.warning(f"{config_label} q={q['id']}: {e}")
+                break
 
         results.append(qr)
         if verbose:
@@ -286,9 +384,14 @@ def _run_config_bc(
 
 
 def _print_progress(config: str, idx: int, total: int, qr: QuestionResult) -> None:
-    em_str = "Y" if qr.exact_match else "N"
+    if qr.format_failure:
+        tag = "FMT_FAIL"
+    elif qr.error:
+        tag = "ERR"
+    else:
+        tag = "EM=Y" if qr.exact_match else "EM=N"
     print(
-        f"  [{config}] {idx}/{total}  EM={em_str}  F1={qr.token_f1:.2f}  "
+        f"  [{config}] {idx}/{total}  {tag}  "
         f"lat={qr.latency_s:.1f}s  {qr.question[:60]}"
     )
 
@@ -298,7 +401,7 @@ def _print_progress(config: str, idx: int, total: int, qr: QuestionResult) -> No
 # ---------------------------------------------------------------------------
 
 def _aggregate(results: list[QuestionResult]) -> dict[str, Any]:
-    """Compute aggregate metrics overall and per-relation."""
+    """Compute aggregate metrics overall, per-relation, and per-tier."""
     if not results:
         return {}
 
@@ -306,42 +409,57 @@ def _aggregate(results: list[QuestionResult]) -> dict[str, Any]:
         n = len(items)
         if n == 0:
             return {}
-        answered = [r for r in items if not r.is_refusal and not r.error]
-        return {
+        fmt_fails = [r for r in items if r.format_failure]
+        valid = [r for r in items if not r.error and not r.format_failure]
+        n_valid = len(valid)
+        errors = sum(1 for r in items if r.error)
+        if n_valid == 0:
+            return {
+                "count": n, "scored_count": 0,
+                "errors": errors, "format_failures": len(fmt_fails),
+            }
+        answered = [r for r in valid if not r.is_refusal]
+        with_kg = [r for r in valid if r.kg_answers]
+        m = {
             "count": n,
-            "exact_match": round(sum(r.exact_match for r in items) / n, 4),
-            "token_f1_mean": round(sum(r.token_f1 for r in items) / n, 4),
-            "answer_rate": round(len(answered) / n, 4),
+            "scored_count": n_valid,
+            "exact_match": round(sum(r.exact_match for r in valid) / n_valid, 4),
+            "kg_recall_mean": round(
+                sum(r.kg_recall for r in with_kg) / len(with_kg), 4
+            ) if with_kg else 0.0,
+            "answer_rate": round(len(answered) / n_valid, 4),
             "hallucination_mean": round(
-                sum(r.hallucination for r in items) / n, 4
+                sum(r.hallucination for r in valid) / n_valid, 4
             ),
-            "latency_mean_s": round(sum(r.latency_s for r in items) / n, 2),
-            "errors": sum(1 for r in items if r.error),
+            "latency_mean_s": round(sum(r.latency_s for r in valid) / n_valid, 2),
+            "errors": errors,
+            "format_failures": len(fmt_fails),
         }
+        val_counts = [r.validated_triplets_count for r in valid]
+        rej_counts = [r.rejected_triplets_count for r in valid]
+        if any(val_counts) or any(rej_counts):
+            m["validated_mean"] = round(sum(val_counts) / n_valid, 2)
+            m["rejected_mean"] = round(sum(rej_counts) / n_valid, 2)
+            m["persisted_mean"] = round(
+                sum(r.persisted_count for r in valid) / n_valid, 2
+            )
+        return m
 
     by_relation: dict[str, list[QuestionResult]] = defaultdict(list)
+    by_tier: dict[str, list[QuestionResult]] = defaultdict(list)
     for r in results:
         by_relation[r.relation].append(r)
+        by_tier[r.tier].append(r)
 
     agg: dict[str, Any] = {
         "overall": _metrics(results),
         "by_relation": {
             rel: _metrics(items) for rel, items in sorted(by_relation.items())
         },
+        "by_tier": {
+            tier: _metrics(items) for tier, items in sorted(by_tier.items())
+        },
     }
-
-    # Agent-specific aggregates (configs B/C)
-    val_counts = [r.validated_triplets_count for r in results]
-    rej_counts = [r.rejected_triplets_count for r in results]
-    if any(val_counts) or any(rej_counts):
-        n = len(results)
-        agg["validation"] = {
-            "validated_mean": round(sum(val_counts) / n, 2),
-            "rejected_mean": round(sum(rej_counts) / n, 2),
-            "persisted_mean": round(
-                sum(r.persisted_count for r in results) / n, 2
-            ),
-        }
 
     return agg
 
@@ -350,35 +468,92 @@ def _aggregate(results: list[QuestionResult]) -> dict[str, Any]:
 # Main evaluation loop
 # ---------------------------------------------------------------------------
 
+_CONFIG_SHORT = {
+    "rag": "rag",
+    "without-validation": "noval",
+    "with-validation": "val",
+}
+
+
+def _build_output_path(output_dir: str, num_questions: int,
+                       split_stats: Optional[dict],
+                       configs: Optional[list[str]] = None) -> str:
+    """Build a descriptive filename like eval_N84_noval_val_f10_p80_z10_20260410_153012.json"""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    parts = [f"eval_N{num_questions}"]
+    if configs:
+        cfg_tags = [_CONFIG_SHORT.get(c, c) for c in configs]
+        parts.append("_".join(cfg_tags))
+    if split_stats:
+        fr = round(split_stats.get("full_ratio", 0) * 100)
+        zr = round(split_stats.get("zero_ratio", 0) * 100)
+        pr = 100 - fr - zr
+        parts.append(f"f{fr}_p{pr}_z{zr}")
+    parts.append(ts)
+    return os.path.join(output_dir, "_".join(parts) + ".json")
+
+
 def evaluate(
     qa_path: str,
     configs: list[str],
-    output_path: str,
+    output_path: Optional[str] = None,
+    output_dir: str = "data/eval",
     store_type: str = "neo4j",
     index_dir: str = "./output/rag_primekb",
     neo4j_uri: str = "bolt://localhost:7687",
     neo4j_password: str = "password123",
     verbose: bool = False,
+    tier_filter: str = "all",
+    split_stats_path: Optional[str] = None,
+    question_ids: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Run evaluation and return the full report dict."""
     with open(qa_path) as f:
         questions = json.load(f)
     logger.info(f"Loaded {len(questions)} questions from {qa_path}")
 
+    if tier_filter != "all":
+        questions = [q for q in questions if q.get("tier", "partial") == tier_filter]
+        logger.info(f"Filtered to {len(questions)} questions (tier={tier_filter})")
+
+    if question_ids:
+        id_set = set(question_ids)
+        questions = [q for q in questions if q["id"] in id_set]
+        logger.info(f"Filtered to {len(questions)} questions by ID: {question_ids}")
+
+    split_stats: Optional[dict] = None
+    if split_stats_path is None:
+        default_stats = os.path.join(os.path.dirname(qa_path), "split_stats.json")
+        if os.path.exists(default_stats):
+            split_stats_path = default_stats
+    if split_stats_path and os.path.exists(split_stats_path):
+        with open(split_stats_path) as f:
+            split_stats = json.load(f)
+
+    _ALIASES = {"A": "rag", "B": "without-validation", "C": "with-validation"}
+    resolved_configs = [_ALIASES.get(c.upper(), c.lower()) for c in configs]
+
+    if output_path is None:
+        output_path = _build_output_path(
+            output_dir, len(questions), split_stats, resolved_configs,
+        )
+
     report: dict[str, Any] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "qa_dataset": qa_path,
         "num_questions": len(questions),
+        "tier_filter": tier_filter,
+        "split_stats": split_stats,
         "configs": {},
     }
 
-    for cfg in configs:
-        cfg = cfg.upper()
+    for cfg in resolved_configs:
         print(f"\n{'='*60}")
-        print(f"Running Config {cfg}")
+        print(f"Running: {cfg}")
         print(f"{'='*60}")
 
-        if cfg == "A":
-            results = _run_config_a(
+        if cfg == "rag":
+            results = _run_rag(
                 questions,
                 store_type=store_type,
                 neo4j_uri=neo4j_uri,
@@ -386,16 +561,16 @@ def evaluate(
                 index_dir=index_dir,
                 verbose=verbose,
             )
-        elif cfg == "B":
-            results = _run_config_bc(
+        elif cfg == "without-validation":
+            results = _run_agent(
                 questions,
                 enable_validation=False,
                 neo4j_uri=neo4j_uri,
                 neo4j_password=neo4j_password,
                 verbose=verbose,
             )
-        elif cfg == "C":
-            results = _run_config_bc(
+        elif cfg == "with-validation":
+            results = _run_agent(
                 questions,
                 enable_validation=True,
                 neo4j_uri=neo4j_uri,
@@ -407,7 +582,7 @@ def evaluate(
             continue
 
         if not results:
-            logger.warning(f"Config {cfg} produced no results (prerequisites missing?)")
+            logger.warning(f"{cfg}: produced no results (prerequisites missing?)")
             report["configs"][cfg] = {"error": "no results (check prerequisites)"}
             continue
 
@@ -417,6 +592,7 @@ def evaluate(
             "results": [asdict(r) for r in results],
         }
 
+    report["output_path"] = output_path
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(report, f, indent=2, default=str)
@@ -437,21 +613,25 @@ def _print_summary(report: dict[str, Any]) -> None:
         return
 
     cfg_labels = sorted(configs.keys())
-    header = f"{'Metric':30s}" + "".join(f"{'Config '+c:>16s}" for c in cfg_labels)
+    col_width = max(16, max((len(c) + 2 for c in cfg_labels), default=16))
+    header = f"{'Metric':30s}" + "".join(f"{c:>{col_width}s}" for c in cfg_labels)
 
-    print("\n" + "=" * (30 + 16 * len(cfg_labels)))
+    total_width = 30 + col_width * len(cfg_labels)
+
+    print("\n" + "=" * total_width)
     print("EVALUATION SUMMARY")
-    print("=" * (30 + 16 * len(cfg_labels)))
+    print("=" * total_width)
     print(header)
-    print("-" * (30 + 16 * len(cfg_labels)))
+    print("-" * total_width)
 
     metrics = [
         ("Exact Match", "exact_match"),
-        ("Token F1 (mean)", "token_f1_mean"),
+        ("KG Recall (mean)", "kg_recall_mean"),
         ("Answer Rate", "answer_rate"),
         ("Hallucination (mean)", "hallucination_mean"),
         ("Latency (s, mean)", "latency_mean_s"),
         ("Errors", "errors"),
+        ("Format Failures", "format_failures"),
     ]
 
     for label, key in metrics:
@@ -460,9 +640,9 @@ def _print_summary(report: dict[str, Any]) -> None:
             agg = configs[c].get("aggregate", {}).get("overall", {})
             val = agg.get(key, "N/A")
             if isinstance(val, float):
-                row += f"{val:>16.4f}"
+                row += f"{val:>{col_width}.4f}"
             else:
-                row += f"{str(val):>16s}"
+                row += f"{str(val):>{col_width}s}"
         print(row)
 
     # Per-relation breakdown
@@ -472,25 +652,60 @@ def _print_summary(report: dict[str, Any]) -> None:
         all_relations.update(by_rel.keys())
 
     if all_relations:
-        print(f"\n{'--- Per-relation Exact Match ---':^{30 + 16 * len(cfg_labels)}}")
+        print(f"\n{'--- Per-relation Exact Match ---':^{total_width}}")
         for rel in sorted(all_relations):
             row = f"  {rel:28s}"
             for c in cfg_labels:
                 by_rel = configs[c].get("aggregate", {}).get("by_relation", {})
                 val = by_rel.get(rel, {}).get("exact_match", "N/A")
                 if isinstance(val, float):
-                    row += f"{val:>16.4f}"
+                    row += f"{val:>{col_width}.4f}"
                 else:
-                    row += f"{str(val):>16s}"
+                    row += f"{str(val):>{col_width}s}"
+            print(row)
+
+    # Per-tier breakdown
+    all_tiers: set[str] = set()
+    for c in cfg_labels:
+        by_tier = configs[c].get("aggregate", {}).get("by_tier", {})
+        all_tiers.update(by_tier.keys())
+
+    if all_tiers:
+        print(f"\n{'--- Per-tier Exact Match ---':^{total_width}}")
+        for tier in sorted(all_tiers):
+            row = f"  {tier:28s}"
+            for c in cfg_labels:
+                by_tier = configs[c].get("aggregate", {}).get("by_tier", {})
+                tier_data = by_tier.get(tier, {})
+                cnt = tier_data.get("count", 0)
+                val = tier_data.get("exact_match", "N/A")
+                if isinstance(val, float):
+                    row += f"{val:>{col_width - 5}.4f} ({cnt})"
+                else:
+                    row += f"{str(val):>{col_width}s}"
+            print(row)
+
+        print(f"\n{'--- Per-tier KG Recall ---':^{total_width}}")
+        for tier in sorted(all_tiers):
+            row = f"  {tier:28s}"
+            for c in cfg_labels:
+                by_tier = configs[c].get("aggregate", {}).get("by_tier", {})
+                tier_data = by_tier.get(tier, {})
+                cnt = tier_data.get("count", 0)
+                val = tier_data.get("kg_recall_mean", "N/A")
+                if isinstance(val, float):
+                    row += f"{val:>{col_width - 5}.4f} ({cnt})"
+                else:
+                    row += f"{str(val):>{col_width}s}"
             print(row)
 
     # Validation stats (if present)
     has_val = any(
-        "validation" in configs[c].get("aggregate", {})
+        "validated_mean" in configs[c].get("aggregate", {}).get("overall", {})
         for c in cfg_labels
     )
     if has_val:
-        print(f"\n{'--- Validation Stats ---':^{30 + 16 * len(cfg_labels)}}")
+        print(f"\n{'--- Validation Stats ---':^{total_width}}")
         for key_label, key_name in [
             ("Validated (mean)", "validated_mean"),
             ("Rejected (mean)", "rejected_mean"),
@@ -498,15 +713,22 @@ def _print_summary(report: dict[str, Any]) -> None:
         ]:
             row = f"  {key_label:28s}"
             for c in cfg_labels:
-                val_stats = configs[c].get("aggregate", {}).get("validation", {})
-                val = val_stats.get(key_name, "")
+                overall = configs[c].get("aggregate", {}).get("overall", {})
+                val = overall.get(key_name, "")
                 if isinstance(val, (int, float)):
-                    row += f"{val:>16.2f}"
+                    row += f"{val:>{col_width}.2f}"
                 else:
-                    row += f"{'':>16s}"
+                    row += f"{'':>{col_width}s}"
             print(row)
 
-    print("=" * (30 + 16 * len(cfg_labels)))
+    # List format-failure question IDs per config
+    for c in cfg_labels:
+        cfg_results = configs[c].get("results", [])
+        ff_ids = [r["qid"] for r in cfg_results if r.get("format_failure")]
+        if ff_ids:
+            print(f"\n  Format-failure questions ({c}): {', '.join(ff_ids)}")
+
+    print("=" * total_width)
 
 
 # ---------------------------------------------------------------------------
@@ -525,19 +747,27 @@ def main() -> None:
     parser.add_argument(
         "--configs",
         nargs="+",
-        default=["A", "B", "C"],
-        help="Configs to run: A (pure-rag), B (agent-no-val), C (full) (default: A B C)",
+        default=["without-validation", "with-validation"],
+        help="Configs to run: rag, without-validation, with-validation "
+             "(default: without-validation with-validation). "
+             "Legacy aliases: A=rag, B=without-validation, C=with-validation",
     )
     parser.add_argument(
         "--output",
-        default="data/eval/eval_report.json",
-        help="Output report JSON (default: data/eval/eval_report.json)",
+        default=None,
+        help="Output report JSON path. If omitted, an auto-generated name "
+             "with dataset size, split ratios, and timestamp is used.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="data/eval",
+        help="Directory for auto-generated report filename (default: data/eval)",
     )
     parser.add_argument(
         "--store-type",
         choices=["neo4j", "faiss"],
         default="neo4j",
-        help="Backend for Config A retrieval (default: neo4j)",
+        help="Backend for 'rag' config retrieval (default: neo4j)",
     )
     parser.add_argument(
         "--index-dir",
@@ -554,6 +784,18 @@ def main() -> None:
         "--neo4j-password",
         default=None,
         help="Neo4j password (default: from NEO4J_PASSWORD env or 'password123')",
+    )
+    parser.add_argument(
+        "--tier",
+        choices=["all", "full", "partial", "zero"],
+        default="all",
+        help="Filter questions by tier (default: all)",
+    )
+    parser.add_argument(
+        "--questions",
+        default=None,
+        help="Comma-separated question IDs to evaluate (e.g. q0014,q0034,q0039). "
+             "If omitted, all questions are evaluated.",
     )
     parser.add_argument(
         "--verbose",
@@ -578,19 +820,24 @@ def main() -> None:
         "NEO4J_PASSWORD", "password123"
     )
 
+    qids = [s.strip() for s in args.questions.split(",")] if args.questions else None
+
     report = evaluate(
         qa_path=args.qa_dataset,
         configs=args.configs,
         output_path=args.output,
+        output_dir=args.output_dir,
         store_type=args.store_type,
         index_dir=args.index_dir,
         neo4j_uri=args.neo4j_uri,
         neo4j_password=neo4j_password,
         verbose=args.verbose,
+        tier_filter=args.tier,
+        question_ids=qids,
     )
 
     _print_summary(report)
-    print(f"\nFull report: {args.output}")
+    print(f"\nFull report: {report['output_path']}")
 
 
 if __name__ == "__main__":

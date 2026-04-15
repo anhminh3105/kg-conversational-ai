@@ -270,6 +270,8 @@ def _build_record(
     gold_answers: list[str],
     relation: str,
     direction: str,
+    tier: str = "partial",
+    kg_answers: list[str] | None = None,
 ) -> dict:
     """Build a single QA record dict (ID is assigned later)."""
     if direction == "forward":
@@ -283,6 +285,8 @@ def _build_record(
         "gold_answers": gold_answers,
         "relation": relation,
         "direction": direction,
+        "tier": tier,
+        "kg_answers": kg_answers if kg_answers is not None else [],
         "source_triplets": triplets,
     }
 
@@ -292,6 +296,36 @@ def _save_records(records: list[dict], path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
         json.dump(records, f, indent=2)
+
+
+def _load_tier_assignments(output_path: str) -> dict[str, dict[str, dict]]:
+    """Load tier_assignments.json from the same directory as the output.
+
+    Returns {entity: {relation: {"tier": str, "kg_answers": list}}} or
+    legacy format {entity: {relation: str}} (auto-detected).
+    """
+    tier_path = os.path.join(os.path.dirname(output_path) or ".", "tier_assignments.json")
+    if os.path.exists(tier_path):
+        with open(tier_path) as f:
+            return json.load(f)
+    return {}
+
+
+def _get_tier_info(
+    tier_assignments: dict,
+    entity: str,
+    relation: str,
+) -> tuple[str, list[str]]:
+    """Extract tier and kg_answers for an entity+relation from assignments.
+
+    Handles both old format (value is str) and new format (value is dict).
+    """
+    entry = tier_assignments.get(entity, {}).get(relation, {})
+    if isinstance(entry, str):
+        return entry, []
+    if isinstance(entry, dict):
+        return entry.get("tier", "partial"), entry.get("kg_answers", [])
+    return "partial", []
 
 
 def _build_questions(
@@ -308,6 +342,7 @@ def _build_questions(
     and *output_path* already exists, previously generated records are loaded
     and their entities are skipped.
     """
+    tier_assignments = _load_tier_assignments(output_path)
     relations = sorted(RELATION_CONTEXT.keys())
 
     # -- Collect entity lists and gold-answer groups from the test CSV ------
@@ -412,12 +447,33 @@ def _build_questions(
                         f"  Fallback for '{entity}' ({relation}/{direction})"
                     )
 
+                if direction == "forward":
+                    entity_tier, entity_kg = _get_tier_info(tier_assignments, entity, relation)
+                else:
+                    # Reverse: entity is a disease, gold_answers are drugs.
+                    # kg_answers = drugs whose (drug, relation, disease) triple is in the KG.
+                    entity_kg = []
+                    tier_labels = set()
+                    for drug in golds[entity]:
+                        drug_tier, drug_kg = _get_tier_info(tier_assignments, drug, relation)
+                        tier_labels.add(drug_tier)
+                        if entity in drug_kg:
+                            entity_kg.append(drug)
+                    if "partial" in tier_labels:
+                        entity_tier = "partial"
+                    elif "full" in tier_labels:
+                        entity_tier = "full"
+                    else:
+                        entity_tier = "zero"
+
                 records.append(_build_record(
                     entity=entity,
                     question=q_text,
                     gold_answers=golds[entity],
                     relation=relation,
                     direction=direction,
+                    tier=entity_tier,
+                    kg_answers=entity_kg,
                 ))
                 done_keys.add(f"{entity}|{relation}|{direction}")
 

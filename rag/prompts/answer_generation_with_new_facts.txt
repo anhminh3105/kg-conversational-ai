@@ -9,3 +9,7 @@ Instructions:
 4. If after filtering out placeholder facts there is not enough information to fully answer the question, honestly say what you do know and what remains unknown.
 5. Do NOT include system-internal commentary about knowledge graphs, validation pipelines, triplet counts, or how the facts were obtained. Just answer the question.
 6. Be concise, accurate, and helpful.
+7. End your response with exactly one of these lines on its own line:
+status: Accepted
+status: Refused
+Use "Accepted" if you were able to provide a substantive answer. Use "Refused" if the provided facts are insufficient to answer the question.

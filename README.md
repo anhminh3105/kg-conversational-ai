@@ -201,13 +201,17 @@ kg-conversational-ai/
 │   ├── visualize_kg.py             # KG visualization (Triplet + PrimeKG schemas)
 │   ├── visulize_graph.py           # Graph visualization (movie data)
 │   └── eval/                       # Evaluation suite (PrimeKG drug-disease)
-│       ├── split_primekb.py        # Stratified entity-disjoint train/test split
+│       ├── split_primekb.py        # Tiered train/test split (Full/Partial/Zero)
 │       ├── generate_qa.py          # LLM-generated QA pairs from test triplets
-│       └── evaluate.py             # Run system + compute metrics (EM, F1, etc.)
+│       ├── evaluate.py             # Run system + compute metrics (EM, KG Recall, etc.)
+│       ├── run_eval_pipeline.sh    # End-to-end automation (split → import → QA → eval)
+│       └── README.md               # Evaluation suite documentation
 ├── export_google_ai.sh             # Google AI Studio config
 ├── export_sambanova.sh             # SambaNova config
 ├── export_local_llm.sh             # Local LLM config
-├── export_dual_llm.sh              # Dual-LLM validation config
+├── export_local_qwen3.sh           # Local Qwen3 config (eval QA generation)
+├── export_dual_llm.sh              # Dual-LLM: local primary + remote validation
+├── export_dual_remote_llm.sh       # Dual-Remote: both LLMs via API (no GPU)
 ├── environment.yml                 # Conda environment
 ├── requirements.txt                # pip requirements
 ├── CHANGELOG.md                    # Release changelog
@@ -322,6 +326,12 @@ source export_sambanova.sh
 
 # Option 3: Local LLM (requires GPU + bitsandbytes)
 source export_local_llm.sh
+
+# Option 4: Dual-LLM — local primary + remote validation (Config C evaluation)
+source export_dual_llm.sh
+
+# Option 5: Dual-Remote — both LLMs via API, no GPU needed
+source export_dual_remote_llm.sh
 ```
 
 Then generate answers:
@@ -686,15 +696,34 @@ You: /quit
 
 Quantitative evaluation of the KG-RAG system using the PrimeKG drug-disease subset (indication, contraindication, off-label use). Compares three configurations: pure RAG, agent without validation, and the full system with dual-LLM validation.
 
+#### Quick start (automated pipeline)
+
+```bash
+# Run everything end-to-end: split → import → QA gen → evaluate
+source export_dual_llm.sh
+bash scripts/eval/run_eval_pipeline.sh
+```
+
 #### Step 1: Extract and split the dataset
 
 ```bash
 # Extract drug-disease subset from PrimeKG (~43K rows)
 python scripts/download_primekb.py --skip_summary
 
-# Stratified entity-disjoint train/test split (20% test)
-python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv
+# Tiered train/test split with configurable tier ratios
+python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv \
+  --max-rows 1000 --full-ratio 0.10 --zero-ratio 0.10
 ```
+
+The split produces three entity tiers that test the system under different knowledge availability:
+
+| Tier | Train coverage | Purpose |
+|------|---------------|---------|
+| **Full** (10%) | 100% of triples | Baseline -- all gold answers are in Neo4j |
+| **Partial** (80%) | 50% of triples | Main test -- system must reason over incomplete data |
+| **Zero** (10%) | 0 triples | Stress test -- entities absent from Neo4j entirely |
+
+Outputs: `train.csv`, `test.csv`, `tier_assignments.json`, `split_stats.json`.
 
 #### Step 2: Generate QA dataset
 
@@ -710,29 +739,87 @@ source export_google_ai.sh
 python scripts/eval/generate_qa.py --remote-llm
 ```
 
-The output file (`qa_dataset.json`) doubles as an incremental cache. If interrupted, re-running resumes from where it left off.
+The output file (`qa_dataset.json`) doubles as an incremental cache. If interrupted, re-running resumes from where it left off. Each question records its tier assignment from the split.
 
 #### Step 3: Evaluate
 
 ```bash
+# Configure LLM backend
+source export_dual_llm.sh          # local primary + remote validation
+# OR
+source export_dual_remote_llm.sh   # both remote (no GPU needed)
+
 # Run all three configs
 python scripts/eval/evaluate.py --configs A B C --verbose
 
-# Run only pure RAG
-python scripts/eval/evaluate.py --configs A
+# Run only agent configs
+python scripts/eval/evaluate.py --configs B C --output-dir data/eval
+
+# Filter by tier
+python scripts/eval/evaluate.py --configs B C --tier partial
+
+# Evaluate specific questions (targeted re-runs)
+python scripts/eval/evaluate.py --configs C \
+  --questions "q0014,q0034,q0039" --output-dir data/eval --verbose
 ```
 
 **Evaluation configurations:**
 
-| Config | Description | Requirements |
-|--------|-------------|-------------|
-| **A** | Pure RAG (no expansion) | FAISS index |
-| **B** | Agent without validation | Neo4j + local LLM |
-| **C** | Full system with dual-LLM validation | Neo4j + local LLM + remote LLM |
+| Config | Alias | Description | Requirements |
+|--------|-------|-------------|-------------|
+| **A** | `rag` | Pure RAG (no expansion) | FAISS index |
+| **B** | `without-validation` | Agent without validation | Neo4j + LLM |
+| **C** | `with-validation` | Full system with dual-LLM validation | Neo4j + LLM + remote LLM |
 
-**Metrics:** Exact Match, Token F1, Answer Rate, Hallucination Proxy, Mean Latency. Reported per-relation and overall.
+**Metrics:** Exact Match, KG Recall, Answer Rate, Hallucination Proxy, Format Failures, Mean Latency. Reported overall, per-relation, and per-tier.
+
+**Format failure handling:** If the LLM omits the expected status line in its answer, the evaluator retries the question up to 3 times. If all attempts fail, the question is marked as a format failure and reported separately (not counted as an error or scored).
+
+**Output files** are auto-named with dataset size, config names, tier ratios, and timestamp (e.g. `eval_N84_noval_val_f10_p80_z10_20260412_181739.json`).
 
 See [`scripts/eval/README.md`](scripts/eval/README.md) for the full CLI reference and output file descriptions.
+
+### 7. LLM Configuration Scripts
+
+Five configuration scripts set environment variables for different LLM backends. Use `source` to load them before running any agent or evaluation command.
+
+| Script | GPU required | Primary LLM | Validation LLM | Typical use |
+|--------|:-----------:|-------------|----------------|-------------|
+| `export_google_ai.sh` | No | Google AI Studio (Gemini) | -- | Quick demos, Config A/B eval |
+| `export_sambanova.sh` | No | SambaNova API | -- | Alternative remote backend |
+| `export_local_llm.sh` | Yes | Local HuggingFace model | -- | Config B eval |
+| `export_local_qwen3.sh` | Yes | Qwen3 (local) | -- | QA dataset generation |
+| `export_dual_llm.sh` | Yes | Local HuggingFace model | Remote API (Gemini) | Config C eval |
+| `export_dual_remote_llm.sh` | No | Remote API (Gemini) | Remote API (Gemini) | Config C eval without GPU |
+
+**Key environment variables:**
+
+| Variable | Set by | Description |
+|----------|--------|-------------|
+| `USE_LOCAL_LLM` | all scripts | `true` for local GPU inference, `false` for API |
+| `LOCAL_LLM_MODEL` | local scripts | HuggingFace model ID (e.g. `Qwen/Qwen2.5-7B-Instruct`) |
+| `LOCAL_LLM_QUANTIZE` | local scripts | Quantization level (`4bit`, `8bit`, or empty) |
+| `LOCAL_LLM_ENABLE_THINKING` | `dual_llm`, `local_qwen3` | Enable chain-of-thought for Qwen3+ models (see below) |
+| `LOCAL_EMBEDDER_MODEL` | all scripts | Embedding model (default: `BAAI/bge-small-en-v1.5`) |
+| `OPENAI_KEY` / `OPENAI_API_BASE` / `OPENAI_MODEL` | remote scripts | Primary LLM via OpenAI-compatible API |
+| `REMOTE_LLM_API_KEY` / `REMOTE_LLM_BASE_URL` / `REMOTE_LLM_MODEL` | dual scripts | Validation LLM for Config C |
+| `HF_TOKEN` | `dual_llm` | HuggingFace token for gated models (MedGemma, etc.) |
+| `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | all scripts | Neo4j connection settings |
+
+#### Chain-of-thought thinking mode (Qwen3+ models)
+
+When using a local Qwen3 or newer model, you can enable an internal chain-of-thought reasoning step. The model produces `<think>...</think>` blocks that are automatically stripped from the final answer but allow deeper multi-step reasoning.
+
+```bash
+# Enable before sourcing the config
+export LOCAL_LLM_ENABLE_THINKING=true
+source export_dual_llm.sh
+
+# Or toggle inline
+LOCAL_LLM_ENABLE_THINKING=true python scripts/demo_mcp_agent.py --validated-expand
+```
+
+Thinking mode is off by default. It increases latency but can improve answer quality for complex reasoning tasks. Only Qwen3+ models support this; the flag is silently ignored for other models.
 
 ## 📝 Adding New Training Data
 

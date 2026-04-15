@@ -1071,6 +1071,7 @@ class MCPAgentWithValidation:
             
             # If re-assessment says sufficient, we're done
             if re_sufficient:
+                knowledge_gap_detected = False
                 if verbose:
                     print(f"\n[Iteration {knowledge_iteration}] Knowledge now SUFFICIENT after validation - proceeding to answer generation")
                 break
@@ -1102,17 +1103,20 @@ class MCPAgentWithValidation:
             print(f"{'='*60}")
         
         # Build final facts: existing KG facts + validated (not-yet-persisted) triplets
-        final_fact_strings = list(existing_fact_strings)
-        validated_fact_strings = []
+        validated_fact_set: set[str] = set()
+        validated_fact_strings: list[str] = []
         for vt in all_validated_triplets:
             triplet_str = vt.get("triplet", "")
-            if triplet_str and triplet_str not in final_fact_strings:
-                final_fact_strings.append(triplet_str)
-                validated_fact_strings.append(triplet_str)
-        
-        # Filter out placeholder/generic facts before passing to the LLM
-        final_fact_strings = [f for f in final_fact_strings if not _is_placeholder_fact(f)]
-        validated_fact_strings = [f for f in validated_fact_strings if not _is_placeholder_fact(f)]
+            if triplet_str and not _is_placeholder_fact(triplet_str):
+                validated_fact_set.add(triplet_str)
+                if triplet_str not in validated_fact_strings:
+                    validated_fact_strings.append(triplet_str)
+
+        # KG facts minus any that already appear as validated (avoid duplication)
+        kg_only_facts = [
+            f for f in existing_fact_strings
+            if not _is_placeholder_fact(f) and f not in validated_fact_set
+        ]
         
         system_prompt = self._get_answer_prompt(
             knowledge_gap_detected,
@@ -1121,7 +1125,7 @@ class MCPAgentWithValidation:
             num_validated=len(all_validated_triplets),
         )
         
-        facts_context = "\n".join(f"- {f}" for f in final_fact_strings)
+        facts_context = "\n".join(f"- {f}" for f in kg_only_facts)
         
         # Build the user message for answer generation
         if validated_fact_strings:

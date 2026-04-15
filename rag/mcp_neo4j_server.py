@@ -46,8 +46,8 @@ NEO4J_TOOLS = [
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "Number of results to return (default: 5, max: 20)",
-                        "default": 5
+                        "description": "Number of results to return (default: 15, max: 30)",
+                        "default": 15
                     }
                 },
                 "required": ["query"]
@@ -384,38 +384,139 @@ class Neo4jMCPToolHandler:
                 "tool": tool_name,
             })
     
+    _ENTITY_EXTRACTION_PROMPT = (
+        "Extract all biomedical entity names (drugs, diseases, conditions, "
+        "genes, proteins) from the following question. Return ONLY a JSON "
+        "array of strings, e.g. [\"Metipranolol\", \"asthma\"]. If no "
+        "entities are found, return [].\n\nQuestion: {query}"
+    )
+
+    def _extract_entity_names(self, query: str) -> list[str]:
+        """Extract entity names from a query using the local LLM."""
+        try:
+            from .edc.edc.utils.llm_utils import openai_chat_completion
+            raw = openai_chat_completion(
+                system_prompt="You are a biomedical named entity extractor.",
+                history=[{
+                    "role": "user",
+                    "content": self._ENTITY_EXTRACTION_PROMPT.format(query=query),
+                }],
+                temperature=0.0,
+                max_tokens=256,
+            )
+            import re as _re
+            cleaned = _re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
+            entities = json.loads(cleaned)
+            if isinstance(entities, list):
+                return [e for e in entities if isinstance(e, str) and len(e) > 1]
+        except Exception as e:
+            logger.debug(f"LLM entity extraction failed, falling back to heuristic: {e}")
+        return self._extract_entity_names_heuristic(query)
+
+    @staticmethod
+    def _extract_entity_names_heuristic(query: str) -> list[str]:
+        """Fallback: extract entity names via regex heuristics."""
+        import re as _re
+        candidates: list[str] = []
+        for m in _re.finditer(r"\b([A-Z][a-z]+(?:\s+[a-z]+)*)\b", query):
+            word = m.group(1)
+            skip = {"Which", "What", "Can", "Are", "How", "The", "Under",
+                    "Does", "Do", "Is", "In", "For", "This", "That", "These"}
+            if word.split()[0] not in skip:
+                candidates.append(word)
+        for m in _re.finditer(
+            r"(?:of|for|is|treating|managing)\s+([a-z][a-z\s\-]+?)(?:\s+(?:in|due|with|disease)|[?.,]|$)",
+            query.lower(),
+        ):
+            term = m.group(1).strip()
+            if len(term) > 3:
+                candidates.append(term)
+        return candidates
+
     def _search_kg(self, query: str, top_k: int) -> str:
         """
-        Semantic search in the knowledge graph.
-        
-        Args:
-            query: Natural language query
-            top_k: Number of results
-            
-        Returns:
-            JSON string with search results
+        Hybrid search: combines vector similarity with direct entity lookup
+        and 1-hop graph expansion.
         """
-        # Validate top_k
-        top_k = min(max(1, top_k), 20)
-        
-        # Embed the query
+        top_k = min(max(1, top_k), 30)
+
+        # --- 1. Vector similarity search ---
         query_embedding = self.embedder.embed_query(query, normalize=True)
-        
-        # Search
-        results = self.store.search(query_embedding, top_k=top_k)
-        
-        # Format results
-        facts = []
-        for r in results:
+        vector_results = self.store.search(query_embedding, top_k=top_k)
+
+        # --- 2. Entity name lookup (graph search) ---
+        entity_names = self._extract_entity_names(query)
+        graph_triplets: list[dict] = []
+        for name in entity_names:
+            try:
+                graph_triplets.extend(
+                    self.store.graph_search(name, max_results=top_k)
+                )
+            except Exception:
+                pass
+
+        # --- 3. Merge and deduplicate ---
+        seen: set[tuple[str, str, str]] = set()
+        facts: list[dict] = []
+
+        for r in vector_results:
             m = r.metadata
-            facts.append({
-                "fact": f"({m['subject']}, {m['predicate']}, {m['object']})",
-                "subject": m["subject"],
-                "predicate": m["predicate"],
-                "object": m["object"],
-                "score": round(r.score, 3),
-            })
-        
+            key = (m["subject"].lower(), m["predicate"].lower(), m["object"].lower())
+            if key not in seen:
+                seen.add(key)
+                facts.append({
+                    "fact": f"({m['subject']}, {m['predicate']}, {m['object']})",
+                    "subject": m["subject"],
+                    "predicate": m["predicate"],
+                    "object": m["object"],
+                    "score": round(r.score, 3),
+                    "source": "vector",
+                })
+
+        for t in graph_triplets:
+            key = (t["subject"].lower(), t["predicate"].lower(), t["object"].lower())
+            if key not in seen:
+                seen.add(key)
+                facts.append({
+                    "fact": f"({t['subject']}, {t['predicate']}, {t['object']})",
+                    "subject": t["subject"],
+                    "predicate": t["predicate"],
+                    "object": t["object"],
+                    "score": 1.0,
+                    "source": "graph",
+                })
+
+        # --- 4. Graph expansion: 1-hop from entities found so far ---
+        entities_to_expand: set[str] = set()
+        for f in facts[:10]:
+            entities_to_expand.add(f["subject"])
+            entities_to_expand.add(f["object"])
+
+        max_expansion = 20
+        expanded = 0
+        for ent in list(entities_to_expand):
+            if expanded >= max_expansion:
+                break
+            try:
+                neighbors = self.store.graph_search(ent, max_results=5)
+                for t in neighbors:
+                    key = (t["subject"].lower(), t["predicate"].lower(), t["object"].lower())
+                    if key not in seen:
+                        seen.add(key)
+                        facts.append({
+                            "fact": f"({t['subject']}, {t['predicate']}, {t['object']})",
+                            "subject": t["subject"],
+                            "predicate": t["predicate"],
+                            "object": t["object"],
+                            "score": 0.5,
+                            "source": "expansion",
+                        })
+                        expanded += 1
+                        if expanded >= max_expansion:
+                            break
+            except Exception:
+                pass
+
         return json.dumps({
             "query": query,
             "num_results": len(facts),
