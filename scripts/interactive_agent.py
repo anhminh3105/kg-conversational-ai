@@ -33,6 +33,17 @@ Usage:
     source export_dual_llm.sh  # Configure remote LLM first
     python scripts/interactive_agent.py --validate
     
+    # Dual-LLM validation without persisting validated triplets to Neo4j
+    # (read-only mode: runs validation but does not mutate the graph)
+    python scripts/interactive_agent.py --validate --no-persist
+
+    # Let the local LLM decide whether to expand on each query
+    # (only enters the propose/validate cycle when assessor says INSUFFICIENT)
+    python scripts/interactive_agent.py --validate --expand-mode auto
+
+    # Force the propose/validate cycle on every query (legacy behavior)
+    python scripts/interactive_agent.py --validate --expand-mode always
+
     # Custom Neo4j connection
     python scripts/interactive_agent.py --neo4j-password mypassword
     
@@ -55,7 +66,8 @@ Interactive Commands:
     /stats             - Show knowledge graph statistics  
     /verbose           - Toggle verbose mode (show tool calls)
     /validate          - Toggle dual-LLM validation mode
-    /expand            - Toggle triplet expansion
+    /expand [mode]     - Cycle expand mode (never -> auto -> always),
+                         or set explicitly: /expand auto
     /history           - Show query history
     /clear             - Clear screen
     /search <query>    - Direct semantic search (no agent reasoning)
@@ -425,9 +437,10 @@ def run_interactive_session(
     neo4j_user: str,
     neo4j_password: str,
     lite_mode: bool = False,
-    enable_expansion: bool = True,
+    expand_mode: str = "never",
     start_verbose: bool = False,
     enable_validation: bool = False,
+    no_persist: bool = False,
 ):
     """
     Run an interactive session with the MCP Agent.
@@ -437,10 +450,27 @@ def run_interactive_session(
         neo4j_user: Neo4j username
         neo4j_password: Neo4j password
         lite_mode: Use API backend instead of local GPU
-        enable_expansion: Enable triplet expansion by default
+        expand_mode: Triplet expansion policy for --validate runs:
+            - "always": force propose/validate cycle on iteration 1
+              (overrides assessor verdicts; legacy behavior).
+            - "auto": run cycle only when the local LLM judges the KG
+              INSUFFICIENT for the query.
+            - "never": skip the cycle entirely; answer from KG only.
+            For non-validate runs this only controls whether the legacy
+            ``expand_triplets`` MCP tool is exposed (any value other than
+            "never" enables it).
         start_verbose: Start with verbose mode enabled
         enable_validation: Enable dual-LLM validation mode
+        no_persist: In dual-LLM mode, run validation without persisting
+            validated triplets to Neo4j (read-only). No effect without
+            --validate since the basic agent never persists.
     """
+    valid_modes = {"always", "auto", "never"}
+    if expand_mode not in valid_modes:
+        raise ValueError(
+            f"expand_mode must be one of {sorted(valid_modes)}; got {expand_mode!r}"
+        )
+    expansion_enabled = expand_mode != "never"
     try:
         import readline  # Enable arrow key history in input
     except ImportError:
@@ -486,7 +516,7 @@ def run_interactive_session(
     handler = Neo4jMCPToolHandler(
         neo4j_store, 
         embedder, 
-        enable_expansion=enable_expansion,
+        enable_expansion=expansion_enabled,
         allow_cypher=True,
     )
     
@@ -521,9 +551,10 @@ def run_interactive_session(
             neo4j_user=neo4j_user,
             neo4j_password=neo4j_password,
             enable_validation=True,
-            auto_expand=True,
+            auto_expand=expansion_enabled,
             max_validation_retries=3,
             max_knowledge_iterations=3,
+            enable_persistence=not no_persist,
         )
     
     print_colored("  Agent ready!", Colors.GREEN)
@@ -536,10 +567,32 @@ def run_interactive_session(
     
     if validation_mode:
         print_colored(f"  Validation Mode: ENABLED (Local: {llm_model.split('/')[-1]} ↔ Remote: {remote_model})", Colors.GREEN)
-    
+        if no_persist:
+            print_colored(
+                "  Persistence: DISABLED (--no-persist; validated triplets "
+                "will NOT be written to Neo4j)",
+                Colors.YELLOW,
+            )
+        else:
+            print_colored("  Persistence: ENABLED (validated triplets will be written to Neo4j)", Colors.GREEN)
+        expand_color = {
+            "always": Colors.MAGENTA,
+            "auto": Colors.GREEN,
+            "never": Colors.YELLOW,
+        }[expand_mode]
+        expand_descr = {
+            "always": "force propose/validate cycle on every query (overrides assessor)",
+            "auto": "propose/validate only when local LLM judges KG insufficient",
+            "never": "skip propose/validate cycle (answer from KG only)",
+        }[expand_mode]
+        print(
+            f"  {Colors.CYAN}Expand mode:{Colors.RESET} {expand_color}{expand_mode}{Colors.RESET}"
+            f" {Colors.GRAY}({expand_descr}){Colors.RESET}"
+        )
+
     # Session state
     verbose_mode = start_verbose
-    expand_mode = enable_expansion
+    expand_mode_str = expand_mode
     query_history = []
     
     # Build tips section with optional PrimeKB examples
@@ -565,7 +618,8 @@ def run_interactive_session(
   /stats             - Show knowledge graph statistics  
   /verbose           - Toggle verbose mode (show tool calls + validation details)
   /validate          - Toggle dual-LLM validation mode (local↔remote)
-  /expand            - Toggle triplet expansion
+  /expand [mode]     - Cycle expand mode (never -> auto -> always),
+                       or set explicitly: /expand auto
   /history           - Show query history
   /clear             - Clear screen
   /search <query>    - Direct semantic search (no agent reasoning)
@@ -593,6 +647,12 @@ def run_interactive_session(
         status_parts.append(f"Verbose: {Colors.GREEN}ON{Colors.RESET}")
     if validation_mode:
         status_parts.append(f"Validation: {Colors.GREEN}ON{Colors.RESET}")
+        mode_color = {
+            "always": Colors.MAGENTA,
+            "auto": Colors.GREEN,
+            "never": Colors.YELLOW,
+        }[expand_mode_str]
+        status_parts.append(f"Expand: {mode_color}{expand_mode_str}{Colors.RESET}")
     if status_parts:
         print("  " + " | ".join(status_parts))
     
@@ -658,10 +718,43 @@ def run_interactive_session(
                     print(f"\n  Verbose mode: {status}")
                 
                 elif cmd == "/expand":
-                    expand_mode = not expand_mode
-                    handler.enable_expansion = expand_mode
-                    status = f"{Colors.GREEN}ON{Colors.RESET}" if expand_mode else f"{Colors.RED}OFF{Colors.RESET}"
-                    print(f"\n  Triplet expansion: {status}")
+                    cycle = ["never", "auto", "always"]
+                    arg = cmd_arg.strip().lower()
+                    if arg:
+                        if arg not in cycle:
+                            print(
+                                f"\n  Unknown expand mode: {arg!r}. "
+                                f"Valid: {', '.join(cycle)}."
+                            )
+                            continue
+                        expand_mode_str = arg
+                    else:
+                        idx = cycle.index(expand_mode_str) if expand_mode_str in cycle else -1
+                        expand_mode_str = cycle[(idx + 1) % len(cycle)]
+
+                    expansion_enabled = expand_mode_str != "never"
+                    handler.enable_expansion = expansion_enabled
+                    if validated_agent is not None:
+                        validated_agent.auto_expand = expansion_enabled
+                    mode_color = {
+                        "always": Colors.MAGENTA,
+                        "auto": Colors.GREEN,
+                        "never": Colors.YELLOW,
+                    }[expand_mode_str]
+                    descr = {
+                        "always": "force propose/validate cycle on every query (overrides assessor)",
+                        "auto": "propose/validate only when local LLM judges KG insufficient",
+                        "never": "skip propose/validate cycle (answer from KG only)",
+                    }[expand_mode_str]
+                    print(
+                        f"\n  Triplet expansion: {mode_color}{expand_mode_str}{Colors.RESET}"
+                        f"\n    {Colors.GRAY}{descr}{Colors.RESET}"
+                    )
+                    if not validation_mode and expansion_enabled:
+                        print(
+                            f"    {Colors.GRAY}(in non-validate mode this only enables the "
+                            f"legacy expand_triplets tool){Colors.RESET}"
+                        )
                 
                 elif cmd == "/validate":
                     if not remote_configured:
@@ -770,7 +863,11 @@ def run_interactive_session(
             try:
                 # Run the appropriate agent
                 if validation_mode and validated_agent:
-                    result = validated_agent.run(user_input, verbose=verbose_mode, force_expand=True)
+                    result = validated_agent.run(
+                        user_input,
+                        verbose=verbose_mode,
+                        force_expand=(expand_mode_str == "always"),
+                    )
                 else:
                     result = agent.run(user_input, verbose=verbose_mode)
                 
@@ -852,6 +949,9 @@ Examples:
   python scripts/interactive_agent.py --verbose          # Start with verbose mode
   python scripts/interactive_agent.py --validate         # Enable dual-LLM validation
   python scripts/interactive_agent.py --validate -v      # Validation + verbose output
+  python scripts/interactive_agent.py --validate --no-persist  # Validation, no Neo4j mutations
+  python scripts/interactive_agent.py --validate --expand-mode auto    # Assessor decides
+  python scripts/interactive_agent.py --validate --expand-mode always  # Always propose/validate
   python scripts/interactive_agent.py --neo4j-password pass123
   python scripts/interactive_agent.py --simple           # Simple search demo (no LLM)
   python scripts/interactive_agent.py --expand           # Triplet expansion demo
@@ -863,6 +963,21 @@ Dual-LLM Validation Mode:
   
   Then run with --validate flag to see the local LLM propose triplets
   and the remote LLM validate them for factual accuracy.
+  
+  Add --no-persist to run validation read-only: proposed triplets are still
+  validated by the remote LLM and surfaced in the verbose output, but the
+  final persistence step is skipped so Neo4j is not mutated. Useful when
+  replaying test questions without accumulating state between runs.
+
+Triplet Expansion Modes (--expand-mode, default: never):
+  always: Always run the propose/validate cycle on iteration 1 (legacy
+          behavior; overrides assessor verdicts).
+  auto:   Only run the propose/validate cycle when the local LLM judges
+          the KG INSUFFICIENT for the query.
+  never:  Skip the propose/validate cycle entirely; answer from KG only.
+
+  Toggle interactively with /expand (cycles never -> auto -> always) or
+  set explicitly with /expand <mode>.
         """
     )
     
@@ -892,14 +1007,38 @@ Dual-LLM Validation Mode:
         help="Start with verbose mode enabled"
     )
     parser.add_argument(
+        "--expand-mode",
+        choices=["always", "auto", "never"],
+        default="never",
+        help=(
+            "Triplet expansion policy for --validate runs (default: never). "
+            "'always' = always run propose/validate cycle on iteration 1 "
+            "(legacy behavior); "
+            "'auto' = run cycle only when local LLM judges KG insufficient; "
+            "'never' = skip the cycle entirely. "
+            "Use /expand at the prompt to switch modes mid-session."
+        ),
+    )
+    parser.add_argument(
         "--no-expansion",
         action="store_true",
-        help="Disable triplet expansion by default"
+        help=(
+            "DEPRECATED: alias for '--expand-mode never' (kept for "
+            "back-compatibility). Prefer --expand-mode."
+        ),
     )
     parser.add_argument(
         "--validate",
         action="store_true",
         help="Enable dual-LLM validation mode (requires remote LLM config)"
+    )
+    parser.add_argument(
+        "--no-persist",
+        action="store_true",
+        help=(
+            "In --validate mode, skip persisting validated triplets to Neo4j "
+            "(read-only dual-LLM mode). No effect without --validate."
+        )
     )
     parser.add_argument(
         "--simple",
@@ -918,7 +1057,19 @@ Dual-LLM Validation Mode:
     )
     
     args = parser.parse_args()
-    
+
+    # Resolve effective expand mode: --no-expansion is a legacy alias for
+    # --expand-mode never, but we warn the user to migrate.
+    expand_mode = args.expand_mode
+    if args.no_expansion:
+        if args.expand_mode != "never":
+            print_colored(
+                "  Note: --no-expansion is deprecated and overrides "
+                f"--expand-mode {args.expand_mode}. Use --expand-mode never instead.",
+                Colors.YELLOW,
+            )
+        expand_mode = "never"
+
     # Get password
     neo4j_password = args.neo4j_password
     if neo4j_password is None:
@@ -967,9 +1118,10 @@ Dual-LLM Validation Mode:
         args.neo4j_user,
         neo4j_password,
         lite_mode=args.lite,
-        enable_expansion=not args.no_expansion,
+        expand_mode=expand_mode,
         start_verbose=args.verbose,
         enable_validation=args.validate,
+        no_persist=args.no_persist,
     )
 
 

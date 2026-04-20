@@ -752,6 +752,7 @@ class MCPAgentWithValidation:
         max_validation_retries: int = 3,
         max_knowledge_iterations: int = 3,
         local_model_name: str = "local_llm",
+        enable_persistence: bool = True,
     ):
         """
         Initialize the agent with validation support.
@@ -770,6 +771,10 @@ class MCPAgentWithValidation:
             max_validation_retries: Maximum retries for validation (default: 3)
             max_knowledge_iterations: Maximum search-assess-expand cycles (default: 3)
             local_model_name: Name of the local LLM for tracking
+            enable_persistence: Whether to persist validated triplets to Neo4j
+                after answer generation. When False, validation runs as usual
+                but the justification + validate_and_persist_triplets step is
+                skipped, so Neo4j is not mutated (useful for read-only testing).
         """
         from .mcp_neo4j_server import Neo4jMCPToolHandler
         
@@ -780,6 +785,7 @@ class MCPAgentWithValidation:
         self.max_validation_retries = max_validation_retries
         self.max_knowledge_iterations = max_knowledge_iterations
         self.local_model_name = local_model_name
+        self.enable_persistence = enable_persistence
         
         # Initialize tool handler with validation enabled
         self.tool_handler = Neo4jMCPToolHandler(
@@ -794,6 +800,7 @@ class MCPAgentWithValidation:
         logger.info(
             f"Initialized MCPAgentWithValidation "
             f"(validation={enable_validation}, auto_expand={auto_expand}, "
+            f"persistence={enable_persistence}, "
             f"max_retries={max_validation_retries}, max_knowledge_iterations={max_knowledge_iterations})"
         )
     
@@ -1197,7 +1204,15 @@ Answer the question naturally based on these facts. Ignore any facts with placeh
         persistence_justification = {}
         skipped_triplets = []
         
-        if all_validated_triplets:
+        if all_validated_triplets and not self.enable_persistence:
+            if verbose:
+                print(
+                    f"\n  Persistence disabled (enable_persistence=False); "
+                    f"skipping justification and persistence of "
+                    f"{len(all_validated_triplets)} validated triplet(s)",
+                    flush=True,
+                )
+        elif all_validated_triplets:
             if verbose:
                 print(f"\n{'='*60}", flush=True)
                 print(f"PERSISTENCE JUSTIFICATION", flush=True)
@@ -2069,6 +2084,7 @@ def create_mcp_agent_with_validation(
     auto_expand: bool = True,
     max_validation_retries: int = 3,
     max_knowledge_iterations: int = 3,
+    enable_persistence: bool = True,
 ) -> MCPAgentWithValidation:
     """
     Convenience function to create an MCPAgentWithValidation.
@@ -2097,6 +2113,9 @@ def create_mcp_agent_with_validation(
         auto_expand: Whether to auto-expand when gaps detected
         max_validation_retries: Maximum retries for validation (default: 3)
         max_knowledge_iterations: Maximum search-assess-expand cycles (default: 3)
+        enable_persistence: Whether to persist validated triplets to Neo4j
+            after answer generation (default: True). Set to False to run
+            dual-LLM validation read-only (no Neo4j mutations).
         
     Returns:
         Configured MCPAgentWithValidation instance
@@ -2121,6 +2140,7 @@ def create_mcp_agent_with_validation(
     logger.info(f"  Embedding model: {embedding_model}")
     logger.info(f"  Validation: {enable_validation}")
     logger.info(f"  Auto-expand: {auto_expand}")
+    logger.info(f"  Persistence: {enable_persistence}")
     logger.info(f"  Max validation retries: {max_validation_retries}")
     logger.info(f"  Max knowledge iterations: {max_knowledge_iterations}")
     
@@ -2146,6 +2166,7 @@ def create_mcp_agent_with_validation(
         max_validation_retries=max_validation_retries,
         max_knowledge_iterations=max_knowledge_iterations,
         local_model_name=local_model_name,
+        enable_persistence=enable_persistence,
     )
     
     return agent

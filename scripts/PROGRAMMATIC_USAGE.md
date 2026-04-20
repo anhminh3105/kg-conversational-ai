@@ -9,6 +9,7 @@ This document consolidates all programmatic and CLI usage documentation for the 
 - [EDC RAG Pipeline](#edc-rag-pipeline)
   - [KGRagIndexer & KGRagGenerator](#kgragindexer--kgraggenerator)
   - [TripletExpander (Standalone)](#tripletexpander-standalone)
+  - [MCPAgentWithValidation (Dual-LLM, Optional Persistence)](#mcpagentwithvalidation-dual-llm-optional-persistence)
   - [PrimeKG Programmatic Usage](#primekg-programmatic-usage)
 - [Atlas RAG Pipeline](#atlas-rag-pipeline)
   - [CLI Reference](#cli-reference)
@@ -68,6 +69,50 @@ expanded = expander.expand(
 # [("Alan_Shepard", "occupation", "Astronaut"),
 #  ("Alan_Shepard", "mission", "Apollo_14"), ...]
 ```
+
+## MCPAgentWithValidation (Dual-LLM, Optional Persistence)
+
+The dual-LLM agent that powers `scripts/interactive_agent.py --validate` is
+also available as a Python API. The `enable_persistence` flag mirrors the
+CLI's `--no-persist`: when `False`, validation runs end-to-end (local LLM
+proposes triplets, remote LLM accepts/rejects them, validated triplets are
+folded into the final answer) but the post-answer
+`validate_and_persist_triplets` step is skipped, so Neo4j is left unchanged.
+Useful for reproducible regression tests, evaluation runs that should not
+mutate the graph, and notebook exploration.
+
+```python
+from rag.mcp_agent import create_mcp_agent_with_validation
+
+# Read-only dual-LLM mode (no Neo4j writes)
+agent = create_mcp_agent_with_validation(
+    neo4j_uri="bolt://localhost:7687",
+    neo4j_user="neo4j",
+    neo4j_password="password123",
+    enable_persistence=False,   # <-- skip writing validated triplets to Neo4j
+)
+
+# Validation still runs; the response carries any newly-validated triplets
+# inline, but Neo4j's :Triplet count is preserved across calls.
+result = agent.run("What are the off-label uses of Propranolol?", verbose=True)
+print(result["answer"])
+```
+
+When `enable_persistence=False` and the run produces validated triplets,
+verbose mode prints a confirmation log line:
+
+```
+Persistence disabled (enable_persistence=False); skipping justification and persistence of N validated triplet(s)
+```
+
+Drop the flag (or pass `enable_persistence=True`, which is the default) to
+restore the standard behaviour where validated triplets are justified and
+written back to Neo4j as new `:Triplet` nodes.
+
+See also: `scripts/interactive_agent.py --validate --no-persist` (CLI
+equivalent), and the
+[`scripts/sample_test_questions.py`](sample_test_questions.py) sampler for
+generating reproducible question batches that pair well with this mode.
 
 ## PrimeKG Programmatic Usage
 
