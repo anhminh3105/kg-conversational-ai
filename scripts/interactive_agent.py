@@ -449,7 +449,12 @@ def run_interactive_session(
         neo4j_uri: Neo4j Bolt URI
         neo4j_user: Neo4j username
         neo4j_password: Neo4j password
-        lite_mode: Use API backend instead of local GPU
+        lite_mode: Use API backend instead of local GPU. When True, the
+            base ``MCPAgent`` (which loads a local HuggingFace model in
+            its constructor) is NOT instantiated. ``main()`` derives
+            this from ``--lite`` or from ``USE_LOCAL_LLM`` being
+            explicitly false-y, so passing ``True`` here is equivalent
+            to either of those.
         expand_mode: Triplet expansion policy for --validate runs:
             - "always": force propose/validate cycle on iteration 1
               (overrides assessor verdicts; legacy behavior).
@@ -484,15 +489,25 @@ def run_interactive_session(
     llm_model = os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
     embedder_model = os.environ.get("LOCAL_EMBEDDER_MODEL", "BAAI/bge-small-en-v1.5")
     quantize = os.environ.get("LOCAL_LLM_QUANTIZE", "4bit")
+    primary_api_model = os.environ.get("OPENAI_MODEL", "")
+    primary_api_base = os.environ.get("OPENAI_API_BASE", "")
     
     # Check for remote LLM configuration
     from rag.edc.edc.utils.llm_utils import is_remote_llm_configured, get_remote_model_name
     remote_configured = is_remote_llm_configured()
     remote_model = get_remote_model_name() if remote_configured else "Not configured"
     
-    print(f"\n  {Colors.CYAN}Local LLM:{Colors.RESET} {llm_model}")
-    print(f"  {Colors.CYAN}Embedder:{Colors.RESET} {embedder_model}")
-    print(f"  {Colors.CYAN}Mode:{Colors.RESET} {'Lite (API)' if lite_mode else 'Full (Local GPU)'}")
+    if lite_mode:
+        primary_label = primary_api_model or "(OPENAI_MODEL not set)"
+        print(f"\n  {Colors.CYAN}Primary LLM:{Colors.RESET} {primary_label} {Colors.GRAY}(remote API){Colors.RESET}")
+        if primary_api_base:
+            print(f"  {Colors.CYAN}Primary API base:{Colors.RESET} {primary_api_base}")
+        print(f"  {Colors.CYAN}Embedder:{Colors.RESET} {embedder_model}")
+        print(f"  {Colors.CYAN}Mode:{Colors.RESET} Lite (API)")
+    else:
+        print(f"\n  {Colors.CYAN}Local LLM:{Colors.RESET} {llm_model}")
+        print(f"  {Colors.CYAN}Embedder:{Colors.RESET} {embedder_model}")
+        print(f"  {Colors.CYAN}Mode:{Colors.RESET} Full (Local GPU)")
     print(f"  {Colors.CYAN}Remote LLM:{Colors.RESET} {remote_model}")
     
     if enable_validation and not remote_configured:
@@ -566,7 +581,12 @@ def run_interactive_session(
         print_colored("  Dataset: PrimeKB biomedical", Colors.GREEN)
     
     if validation_mode:
-        print_colored(f"  Validation Mode: ENABLED (Local: {llm_model.split('/')[-1]} ↔ Remote: {remote_model})", Colors.GREEN)
+        if lite_mode:
+            primary_label = primary_api_model or "remote API"
+            proposer_label = f"Primary: {primary_label} (API)"
+        else:
+            proposer_label = f"Local: {llm_model.split('/')[-1]}"
+        print_colored(f"  Validation Mode: ENABLED ({proposer_label} ↔ Remote: {remote_model})", Colors.GREEN)
         if no_persist:
             print_colored(
                 "  Persistence: DISABLED (--no-persist; validated triplets "
@@ -765,7 +785,11 @@ def run_interactive_session(
                         status = f"{Colors.GREEN}ON{Colors.RESET}" if validation_mode else f"{Colors.RED}OFF{Colors.RESET}"
                         print(f"\n  Dual-LLM Validation: {status}")
                         if validation_mode:
-                            print(f"    {Colors.CYAN}Local:{Colors.RESET}  {llm_model.split('/')[-1]} (proposes triplets)")
+                            if lite_mode:
+                                proposer = primary_api_model or "remote API"
+                                print(f"    {Colors.CYAN}Primary:{Colors.RESET} {proposer} (API, proposes triplets)")
+                            else:
+                                print(f"    {Colors.CYAN}Local:{Colors.RESET}  {llm_model.split('/')[-1]} (proposes triplets)")
                             print(f"    {Colors.MAGENTA}Remote:{Colors.RESET} {remote_model} (validates triplets)")
                             print(f"    Use /verbose to see detailed LLM interactions.")
                 
@@ -999,7 +1023,12 @@ Triplet Expansion Modes (--expand-mode, default: never):
     parser.add_argument(
         "--lite",
         action="store_true",
-        help="Use lite mode (API backend instead of local GPU)"
+        help=(
+            "Use lite mode (API backend instead of local GPU). "
+            "Also auto-enabled when USE_LOCAL_LLM is explicitly set to a "
+            "false-y value (false/0/no/off), e.g. via "
+            "`source export_dual_remote_llm.sh`."
+        ),
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -1070,6 +1099,24 @@ Triplet Expansion Modes (--expand-mode, default: never):
             )
         expand_mode = "never"
 
+    # Resolve effective lite mode. The base agent (rag.mcp_agent.MCPAgent)
+    # loads a local HuggingFace model into GPU memory in its constructor, so
+    # we must NOT instantiate it whenever the user asked for a remote-only
+    # setup. The rest of the codebase (llm_utils.openai_chat_completion) keys
+    # off USE_LOCAL_LLM, so we mirror that contract here:
+    #   - --lite always wins
+    #   - USE_LOCAL_LLM explicitly false-y -> auto-enable lite mode
+    #   - unset / "true" -> preserve historical default (full local mode)
+    use_local_env = os.environ.get("USE_LOCAL_LLM", "").strip().lower()
+    env_disables_local = use_local_env in {"false", "0", "no", "off"}
+    lite_mode = args.lite or env_disables_local
+    if env_disables_local and not args.lite:
+        print_colored(
+            f"  Note: USE_LOCAL_LLM={use_local_env!r}; auto-enabling --lite "
+            "so the local GPU model is not loaded.",
+            Colors.YELLOW,
+        )
+
     # Get password
     neo4j_password = args.neo4j_password
     if neo4j_password is None:
@@ -1117,7 +1164,7 @@ Triplet Expansion Modes (--expand-mode, default: never):
         args.neo4j_uri,
         args.neo4j_user,
         neo4j_password,
-        lite_mode=args.lite,
+        lite_mode=lite_mode,
         expand_mode=expand_mode,
         start_verbose=args.verbose,
         enable_validation=args.validate,
