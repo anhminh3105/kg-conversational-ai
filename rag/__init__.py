@@ -27,13 +27,13 @@ Usage:
     # Index from PrimeKG (auto-detected from .csv extension)
     indexer = KGRagIndexer()
     indexer.index_from_path("./data/kg.csv", mode="triplet_text")
-    indexer.save("./output/rag_primekb")
+    indexer.save("./output/rag_primekg")
     
     # Index PrimeKG with filters
     indexer = KGRagIndexer()
     indexer.index_from_path(
         "./data/kg.csv",
-        fmt="primekb",
+        fmt="primekg",
         node_types=["drug", "disease"],
         max_rows=100000,
     )
@@ -60,7 +60,7 @@ Usage:
 """
 
 from .triplet_loader import TripletLoader, Triplet, get_loader
-from .primekb_loader import PrimeKBLoader
+from .primekg_loader import PrimeKGLoader
 from .representation import TripletRepresenter, RepresentationMode, EmbeddableItem, get_representer
 from .embedder import Embedder, get_embedder
 from .faiss_store import FaissStore, SearchResult
@@ -115,7 +115,7 @@ __all__ = [
     "TripletLoader",
     "Triplet",
     "get_loader",
-    "PrimeKBLoader",
+    "PrimeKGLoader",
     
     # Representation
     "TripletRepresenter",

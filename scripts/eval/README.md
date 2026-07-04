@@ -25,7 +25,7 @@ bash scripts/eval/run_eval_pipeline.sh
               │
               ▼
    ┌─────────────────────────────────────────────────────────────────────┐
-   │ split_primekb.py                                                    │
+   │ split_primekg.py                                                    │
    │   • drug-aware sampling (--max-rows)                                │
    │   • per-relation entity-disjoint split (--test-ratio)               │
    │   • Full / Partial tier assignment (--full-ratio)                   │
@@ -38,7 +38,7 @@ bash scripts/eval/run_eval_pipeline.sh
               └─► split_stats.json        (hyperparameters + counts)
               │
               ▼
-   import_primekb_to_neo4j.py --input train.csv --clear        →  Neo4j
+   import_primekg_to_neo4j.py --input train.csv --clear        →  Neo4j
               │
               ▼
    ┌─────────────────────────────────────────────────────────────────────┐
@@ -61,7 +61,7 @@ bash scripts/eval/run_eval_pipeline.sh
 
 ## Dataset Preparation & Tiered Train / Test Split
 
-`split_primekb.py` is the heart of the evaluation pipeline: it takes the
+`split_primekg.py` is the heart of the evaluation pipeline: it takes the
 PrimeKG drug-disease subset and produces an entity-disjoint train/test split
 plus a tier assignment that controls *exactly* which gold triples each test
 question can or cannot recover from Neo4j alone. The design lets us measure
@@ -383,16 +383,16 @@ full 154 test rows for QA generation.
 
 ```bash
 # Default: 1000-row drug-aware sample, 80/20 train/test, 30/70 Full/Partial
-python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv
+python scripts/eval/split_primekg.py --input data/kg_drug_disease.csv
 
 # Larger sample (5 K rows), fewer held-out answers per Partial drug
-python scripts/eval/split_primekb.py \
+python scripts/eval/split_primekg.py \
     --input data/kg_drug_disease.csv \
     --max-rows 5000 \
     --partial-include 0.7
 
 # Use the entire 43 K-row drug-disease subset (slow but most realistic)
-python scripts/eval/split_primekb.py \
+python scripts/eval/split_primekg.py \
     --input data/kg_drug_disease.csv \
     --max-rows 0
 ```
@@ -402,7 +402,7 @@ python scripts/eval/split_primekb.py \
 
 | Flag                | Default                    | Description                                                                    |
 | ------------------- | -------------------------- | ------------------------------------------------------------------------------ |
-| `--input`           | `data/kg_drug_disease.csv` | Path to the drug-disease subset CSV produced by `scripts/download_primekb.py`  |
+| `--input`           | `data/kg_drug_disease.csv` | Path to the drug-disease subset CSV produced by `scripts/download_primekg.py`  |
 | `--output-dir`      | `data/eval`                | Directory where the four output files are written                              |
 | `--test-ratio`      | `0.2`                      | Per-relation target fraction of rows to send to the test bucket (Stage 2)      |
 | `--max-rows`        | `1000`                     | Cap total input rows via drug-aware sampling (Stage 1). `0` disables sampling. |
@@ -422,7 +422,7 @@ shuffle in `entity_disjoint_split()`, and the multi-triple-drug shuffle in
 `pd.DataFrame.sample(random_state=seed)` (note: not the same RNG, but
 derived from the same `--seed` value).
 
-Re-running `split_primekb.py` with the same `--seed`, same `--input`, and
+Re-running `split_primekg.py` with the same `--seed`, same `--input`, and
 the same hyperparameters produces byte-identical `train.csv`, `test.csv`,
 and `tier_assignments.json`. This is what makes the eval suite a true
 benchmark: every Config B vs Config C comparison runs against the same
@@ -461,7 +461,7 @@ by `2 × 100 × n_relations = 600` in the worst case.
 
 For a **forward** question the entity is the test drug **D**, and all
 three answer lists come straight from `tier_assignments.json[D][r]`
-(they were already computed by `split_primekb.py`):
+(they were already computed by `split_primekg.py`):
 
 ```
 gold_answers      = kg_answers ∪ held_out_answers   (the whole gold set in test.csv)
@@ -500,7 +500,7 @@ The same Stage 2 entity-disjointness guarantee that bounds the forward
 metric also bounds the reverse one: a drug whose `(drug, r, X)` edge is
 in `train.csv` lands in `kg_answers`; the rest land in `held_out_answers`
 and remain Config C's recovery target. Because each drug's tier was
-fixed by `split_primekb.py` (never recomputed at QA time), the per-drug
+fixed by `split_primekg.py` (never recomputed at QA time), the per-drug
 visibility carries through to the reverse axis without any new
 randomness.
 
@@ -598,7 +598,7 @@ What this example pins down:
    into its propose / validate path — i.e. the tier label matches the
    recovery work the question actually requires.
 - **No new visibility is introduced.** Reverse questions reuse the *same*
-   `kg_answers` / `held_out_answers` records that `split_primekb.py` wrote
+   `kg_answers` / `held_out_answers` records that `split_primekg.py` wrote
    for each forward `(drug, relation)` pair. There is no separate reverse
    split, no second tier assignment, and no chance for a Partial held-out
    edge to silently appear as a Full answer on the reverse axis.
@@ -650,7 +650,7 @@ local and a remote backend are configured in the same shell.
 
 | Flag                           | Default                     | Description                                               |
 | ------------------------------ | --------------------------- | --------------------------------------------------------- |
-| `--test-csv`                   | `data/eval/test.csv`        | Path to the test split CSV produced by `split_primekb.py` |
+| `--test-csv`                   | `data/eval/test.csv`        | Path to the test split CSV produced by `split_primekg.py` |
 | `--output`                     | `data/eval/qa_dataset.json` | Output JSON path; also the resume cache                   |
 | `--max-questions-per-relation` | `100`                       | Cap *per direction* (so up to 200 per relation total)     |
 | `--batch-size`                 | `15`                        | Entities per LLM API call (per tier-routed sub-batch)     |
@@ -746,7 +746,7 @@ python scripts/eval/evaluate.py --configs C \
 | `--output`         | auto-generated                        | Explicit path for report JSON                              |
 | `--output-dir`     | `data/eval`                           | Directory for auto-named report                            |
 | `--store-type`     | `neo4j`                               | Backend for Config A retrieval (`neo4j` or `faiss`)        |
-| `--index-dir`      | `./output/rag_primekb`                | FAISS index directory (Config A with `--store-type faiss`) |
+| `--index-dir`      | `./output/rag_primekg`                | FAISS index directory (Config A with `--store-type faiss`) |
 | `--neo4j-uri`      | `bolt://localhost:7687`               | Neo4j Bolt URI                                             |
 | `--neo4j-password` | env `NEO4J_PASSWORD` or `password123` | Neo4j password                                             |
 | `--tier`           | `all`                                 | Filter questions by tier (`full`, `partial`, `all`)        |
@@ -816,7 +816,7 @@ Aliases used here: `rag` for Config A, `noval` for B, `val` for C.
 is rerun.
 
 If `split_stats.json` is missing (e.g. evaluating an arbitrary
-`qa_dataset.json` that did not come from `split_primekb.py`), the
+`qa_dataset.json` that did not come from `split_primekg.py`), the
 `f{n}_p{n}` block is omitted from the filename. Override the entire path
 with `--output` if you want a stable, non-timestamped report file.
 
@@ -874,7 +874,7 @@ The pipeline and agent read these from the environment (set by `source export_*.
 
 1. **Prerequisites** -- Checks Python deps, verifies or starts Neo4j, verifies LLM env.
 2. **Data prep** -- Downloads `kg_drug_disease.csv` if missing.
-3. **Split** -- Runs `split_primekb.py` with drug-aware tier assignment.
+3. **Split** -- Runs `split_primekg.py` with drug-aware tier assignment.
 4. **QA generation** -- Runs `generate_qa.py` (skippable with `--skip-qa-gen`).
 5. **Neo4j import** -- Clears Neo4j and imports `train.csv`.
 6. **Evaluate** -- Runs `evaluate.py` for the specified configs.
@@ -916,7 +916,7 @@ Strategies to mitigate this:
 | `401 Client Error` (HuggingFace)              | Gated model access                           | Set `HF_TOKEN` in env; accept license at huggingface.co                                                                 |
 | `Developer instruction not enabled`           | Model doesn't support system prompts         | Switch to Gemma 4+ or Gemini models                                                                                     |
 | `Max retries (3) exceeded: Request timed out` | API rate limit or slow response              | Increase `OPENAI_HTTP_TIMEOUT` / `REMOTE_LLM_HTTP_TIMEOUT` (e.g., 300-600s); re-run failed questions with `--questions` |
-| Stale triplets inflating Config C scores      | Config C persisted triplets from a prior run | Clear Neo4j first: `run_eval_clean.sh` or `import_primekb_to_neo4j.py --clear`                                          |
+| Stale triplets inflating Config C scores      | Config C persisted triplets from a prior run | Clear Neo4j first: `run_eval_clean.sh` or `import_primekg_to_neo4j.py --clear`                                          |
 
 
 ### Re-running Failed Questions
@@ -995,7 +995,7 @@ The sampler shares its inputs with this directory via `--source`:
 
 `--source train`, `test`, and `partial` (default) all require this
 directory's artifacts to have been produced by
-`[split_primekb.py](split_primekb.py)`; the sampler exits with a one-line
+`[split_primekg.py](split_primekg.py)`; the sampler exits with a one-line
 remediation message if any file is missing.
 
 For `--source partial`, each emitted JSON record additionally carries

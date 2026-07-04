@@ -167,7 +167,7 @@ kg-conversational-ai/
 ├── data/
 │   ├── movie_data.csv              # Sample movie dataset
 │   ├── training_data_complete.json # Training examples (with Cypher)
-│   ├── kg.csv                      # PrimeKG dataset (download with scripts/download_primekb.py)
+│   ├── kg.csv                      # PrimeKG dataset (download with scripts/download_primekg.py)
 │   ├── kg_drug_disease.csv         # PrimeKG drug-disease subset (filtered from kg.csv)
 │   ├── disease_features.csv        # DrugBank feature columns (half_life, mechanism_of_action, ...)
 │   └── eval/                       # Outputs of scripts/eval/* (generated)
@@ -182,7 +182,7 @@ kg-conversational-ai/
 ├── rag/                            # RAG module
 │   ├── __init__.py                 # Module exports
 │   ├── triplet_loader.py           # Step 1: Load EDC triplets + get_loader() factory
-│   ├── primekb_loader.py           # Step 1b: Load PrimeKG triplets from kg.csv
+│   ├── primekg_loader.py           # Step 1b: Load PrimeKG triplets from kg.csv
 │   ├── representation.py           # Step 2: Convert to text
 │   ├── embedder.py                 # Step 3: Generate embeddings
 │   ├── faiss_store.py              # Step 4: FAISS vector store
@@ -199,11 +199,11 @@ kg-conversational-ai/
 │       │   ├── kg_qa.txt           # QA prompt template
 │       │   └── triplet_expansion.txt # Expansion prompt template
 │       └── schemas/                # Schema definitions
-│           └── primekb_schema.csv  # PrimeKG relation definitions
+│           └── primekb_schema.csv  # PrimeKG relation definitions (legacy filename inside the rag/edc submodule)
 ├── scripts/
 │   ├── import_kg_data_from_json.py # Movie data import script
-│   ├── import_primekb_to_neo4j.py  # PrimeKG CSV -> Neo4j :Triplet nodes (with embeddings)
-│   ├── download_primekb.py         # Download PrimeKG from Harvard Dataverse
+│   ├── import_primekg_to_neo4j.py  # PrimeKG CSV -> Neo4j :Triplet nodes (with embeddings)
+│   ├── download_primekg.py         # Download PrimeKG from Harvard Dataverse
 │   ├── nlp_to_cypher.py            # ML-based NLP-to-Cypher
 │   ├── llm_light_train.py          # Transformer training
 │   ├── llm_light_demo.py           # Transformer demo/inference
@@ -215,7 +215,7 @@ kg-conversational-ai/
 │   ├── visualize_kg.py             # KG visualization (Triplet + PrimeKG schemas)
 │   ├── visulize_graph.py           # Graph visualization (movie data)
 │   └── eval/                       # Evaluation suite (PrimeKG drug-disease)
-│       ├── split_primekb.py        # Drug-aware 2-tier train/test split (Full/Partial)
+│       ├── split_primekg.py        # Drug-aware 2-tier train/test split (Full/Partial)
 │       ├── generate_qa.py          # Tier-aware LLM-generated QA from test triplets
 │       ├── evaluate.py             # Run system + compute metrics (Gold Recall, etc.)
 │       ├── merge_eval_reports.py   # Merge supplementary results into existing reports
@@ -415,22 +415,22 @@ The system supports [PrimeKG](https://zitniklab.hms.harvard.edu/projects/PrimeKG
 **Download PrimeKG:**
 
 ```bash
-python scripts/download_primekb.py              # downloads kg.csv (~580 MB)
-python scripts/download_primekb.py --all         # also drug/disease feature files
+python scripts/download_primekg.py              # downloads kg.csv (~580 MB)
+python scripts/download_primekg.py --all         # also drug/disease feature files
 ```
 
 **Index PrimeKG for RAG:**
 
 ```bash
 # Full dataset (may take a while)
-python scripts/index_rag.py --input ./data/kg.csv --output_dir ./output/rag_primekb
+python scripts/index_rag.py --input ./data/kg.csv --output_dir ./output/rag_primekg
 
 # Subset: only drug-disease relationships
-python scripts/index_rag.py --input ./data/kg.csv --format primekb \
-  --node_types drug,disease --max_rows 100000 --output_dir ./output/rag_primekb
+python scripts/index_rag.py --input ./data/kg.csv --format primekg \
+  --node_types drug,disease --max_rows 100000 --output_dir ./output/rag_primekg
 
 # Then search / generate as usual
-python scripts/index_rag.py --load ./output/rag_primekb --auto_filter --query "What drugs treat diabetes?" --top_k 50
+python scripts/index_rag.py --load ./output/rag_primekg --auto_filter --query "What drugs treat diabetes?" --top_k 50
 ```
 
 **Import PrimeKG into Neo4j as :Triplet nodes (one step):**
@@ -440,19 +440,19 @@ to Neo4j, ready for the demo scripts and RAG pipeline.
 
 ```bash
 # Default: import the drug-disease subset (~42K rows)
-python scripts/import_primekb_to_neo4j.py
+python scripts/import_primekg_to_neo4j.py
 
 # Import the full PrimeKG dataset
-python scripts/import_primekb_to_neo4j.py --input data/kg.csv
+python scripts/import_primekg_to_neo4j.py --input data/kg.csv
 
 # Wipe all existing nodes first, then import
-python scripts/import_primekb_to_neo4j.py --clear
+python scripts/import_primekg_to_neo4j.py --clear
 
 # Limit rows for a quick test
-python scripts/import_primekb_to_neo4j.py --max-rows 500
+python scripts/import_primekg_to_neo4j.py --max-rows 500
 
 # Filter by relation types
-python scripts/import_primekb_to_neo4j.py --relation-types contraindication,indication
+python scripts/import_primekg_to_neo4j.py --relation-types contraindication,indication
 
 # Now demos work with PrimeKG data
 python scripts/demo_mcp_agent.py --simple
@@ -467,7 +467,7 @@ python scripts/interactive_agent.py --lite
 | Node types     | `--node_types`     | Comma-separated list (e.g. `drug,disease,gene/protein`) |
 | Relation types | `--relation_types` | Comma-separated list (e.g. `treats,associates`)         |
 | Row limit      | `--max_rows`       | Cap CSV rows loaded (useful for quick experiments)      |
-| Format         | `--format primekb` | Force PrimeKG format (auto-detected for `.csv` files)   |
+| Format         | `--format primekg` | Force PrimeKG format (auto-detected for `.csv` files)   |
 
 
 ### Migrate FAISS Index to Neo4j (`[scripts/migrate_faiss_to_neo4j.py](scripts/migrate_faiss_to_neo4j.py)`)
@@ -498,19 +498,19 @@ For the biomedical PrimeKG dataset, first index into FAISS then migrate:
 
 ```bash
 # 1. Index PrimeKG into FAISS (full or filtered)
-python scripts/index_rag.py --input ./data/kg.csv --output_dir ./output/rag_primekb
-python scripts/index_rag.py --input ./data/kg.csv --format primekb \
-    --node_types drug,disease --max_rows 100000 --output_dir ./output/rag_primekb
+python scripts/index_rag.py --input ./data/kg.csv --output_dir ./output/rag_primekg
+python scripts/index_rag.py --input ./data/kg.csv --format primekg \
+    --node_types drug,disease --max_rows 100000 --output_dir ./output/rag_primekg
 
 # 2. Migrate to Neo4j (clear to avoid mixing with WebNLG data)
-python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb --clear
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekg --clear
 
 # 3. Re-embed during migration (useful if switching embedding models)
-python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb \
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekg \
     --re-embed --embedding-model BAAI/bge-small-en-v1.5
 
 # 4. Dry run to preview without writing
-python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb --dry-run
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekg --dry-run
 ```
 
 **Migration CLI options:**
@@ -554,10 +554,10 @@ Generates visualization files in `outputs/`:
 python scripts/visualize_kg.py --output outputs/kg_full.png
 
 # Visualize native PrimeKG graph
-python scripts/visualize_kg.py --schema primekb --output outputs/primekb_graph.png
+python scripts/visualize_kg.py --schema primekg --output outputs/primekg_graph.png
 
 # Visualize PrimeKG entity subgraph
-python scripts/visualize_kg.py --schema primekb --entity "aspirin" --depth 2
+python scripts/visualize_kg.py --schema primekg --entity "aspirin" --depth 2
 ```
 
 ### 5. MCP Agent -- Agentic Knowledge Graph Q&A
@@ -576,9 +576,9 @@ All MCP Agent workflows require Neo4j with indexed data:
 python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag
 
 # Or use PrimeKG data instead:
-python scripts/index_rag.py --input ./data/kg.csv --format primekb \
-    --node_types drug,disease --output_dir ./output/rag_primekb
-python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb
+python scripts/index_rag.py --input ./data/kg.csv --format primekg \
+    --node_types drug,disease --output_dir ./output/rag_primekg
+python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekg
 
 # Configure an LLM provider
 source export_sambanova.sh    # or export_google_ai.sh, export_local_llm.sh
@@ -862,7 +862,7 @@ prerequisites). Stratified across the three drug-disease relations
 of forward (drug -> disease) and reverse (disease -> drug) phrasings
 drawn from the same templates as `scripts/eval/generate_qa.py`.
 - `**train**` -- drugs whose triples were placed in Neo4j by
-`scripts/eval/split_primekb.py`. Best for sanity-checking RAG on facts
+`scripts/eval/split_primekg.py`. Best for sanity-checking RAG on facts
 that should be retrievable directly.
 - `**test**` -- drugs whose triples were held out from Neo4j entirely.
 Best for exercising the agent's knowledge-gap behaviour at the drug
@@ -875,11 +875,11 @@ changes.
 **Prerequisites:**
 
 - `--source kg` only needs `data/kg_drug_disease.csv` (run
-`python scripts/download_primekb.py --skip_summary`).
+`python scripts/download_primekg.py --skip_summary`).
 - `--source train` / `test` / `partial` (default) all need the eval split
 artifacts under `--split-dir` (default `data/eval/`):
   ```bash
-  python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv
+  python scripts/eval/split_primekg.py --input data/kg_drug_disease.csv
   ```
   The sampler exits with a single-line remediation message if any required
   file is missing.
@@ -945,10 +945,10 @@ bash scripts/eval/run_eval_pipeline.sh
 
 ```bash
 # Extract drug-disease subset from PrimeKG (~43K rows)
-python scripts/download_primekb.py --skip_summary
+python scripts/download_primekg.py --skip_summary
 
 # Drug-aware 2-tier split
-python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv \
+python scripts/eval/split_primekg.py --input data/kg_drug_disease.csv \
   --max-rows 1000 --full-ratio 0.30
 ```
 

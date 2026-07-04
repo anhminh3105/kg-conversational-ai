@@ -14,7 +14,7 @@ Prerequisites:
 - Neo4j running at bolt://localhost:7687
 - Knowledge graph data loaded via one of:
     Path A (RAG pipeline): index_rag.py + migrate_faiss_to_neo4j.py
-    Path B (PrimeKB): import_primekb_to_neo4j.py
+    Path B (PrimeKG): import_primekg_to_neo4j.py
 - GPU with ~6GB VRAM for Qwen2.5-7B with 4-bit quantization
 
 Usage:
@@ -76,8 +76,8 @@ PRIMEKB_PREDICATES = {
 }
 
 
-def _detect_primekb_data(driver) -> bool:
-    """Check whether :Triplet nodes contain PrimeKB biomedical predicates."""
+def _detect_primekg_data(driver) -> bool:
+    """Check whether :Triplet nodes contain PrimeKG biomedical predicates."""
     try:
         with driver.session() as session:
             result = session.run(
@@ -190,13 +190,13 @@ def run_mcp_agent_demo(
     
     print("  Agent created successfully!")
     
-    # Demo queries -- detect PrimeKB biomedical data and pick appropriate set
+    # Demo queries -- detect PrimeKG biomedical data and pick appropriate set
     demo_queries = [
         "What is in the knowledge graph?",
         "Tell me about the main entities in the database.",
         "What relationships exist between entities?",
     ]
-    primekb_queries = [
+    primekg_queries = [
         "What drugs treat diabetes?",
         "What are the side effects of aspirin?",
         "What genes are associated with Alzheimer's disease?",
@@ -207,9 +207,9 @@ def run_mcp_agent_demo(
         if hasattr(agent, "neo4j_store")
         else None
     )
-    if neo4j_driver and _detect_primekb_data(neo4j_driver):
-        print("\n  \033[1;32mDetected PrimeKB biomedical data — using domain queries\033[0m")
-        demo_queries = primekb_queries
+    if neo4j_driver and _detect_primekg_data(neo4j_driver):
+        print("\n  \033[1;32mDetected PrimeKG biomedical data — using domain queries\033[0m")
+        demo_queries = primekg_queries
     
     print("\n" + "=" * 60)
     print("Step 3: Running Demo Queries")

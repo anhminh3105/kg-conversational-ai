@@ -251,7 +251,7 @@ validation).
 
 ### 6.1 Two-Tier Drug-Aware Split
 
-`scripts/eval/split_primekb.py` produces an entity-disjoint train/test
+`scripts/eval/split_primekg.py` produces an entity-disjoint train/test
 split where every test drug is assigned to one of two tiers. The full
 algorithm has four stages, each controlled by a CLI hyperparameter that
 shows up in `data/eval/split_stats.json` for reproducibility:
@@ -471,7 +471,7 @@ Config C persists validated triplets to Neo4j during evaluation. When
 comparing Config B and Config C, always start from a clean Neo4j:
 
 ```bash
-python scripts/import_primekb_to_neo4j.py --input data/eval/train.csv --clear
+python scripts/import_primekg_to_neo4j.py --input data/eval/train.csv --clear
 ```
 
 Or use `scripts/eval/run_eval_clean.sh` which handles clearing automatically.

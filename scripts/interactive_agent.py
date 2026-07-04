@@ -14,7 +14,7 @@ Prerequisites:
 - Neo4j running at bolt://localhost:7687
 - Knowledge graph data loaded via one of:
     Path A (RAG pipeline): index_rag.py + migrate_faiss_to_neo4j.py
-    Path B (PrimeKB): import_primekb_to_neo4j.py
+    Path B (PrimeKG): import_primekg_to_neo4j.py
 - For full mode: GPU with ~6GB VRAM for Qwen2.5-7B with 4-bit quantization
 - For lite mode: API backend configured (export_google_ai.sh or similar)
 - For validation mode: Remote LLM configured (export_dual_llm.sh)
@@ -102,8 +102,8 @@ PRIMEKB_PREDICATES = {
 }
 
 
-def _detect_primekb_data(driver) -> bool:
-    """Check whether :Triplet nodes contain PrimeKB biomedical predicates."""
+def _detect_primekg_data(driver) -> bool:
+    """Check whether :Triplet nodes contain PrimeKG biomedical predicates."""
     try:
         with driver.session() as session:
             result = session.run(
@@ -575,10 +575,10 @@ def run_interactive_session(
     print_colored("  Agent ready!", Colors.GREEN)
     print(f"  Knowledge Graph: {neo4j_store.size} triplets")
     
-    # Detect PrimeKB data
-    is_primekb = _detect_primekb_data(neo4j_store.driver)
-    if is_primekb:
-        print_colored("  Dataset: PrimeKB biomedical", Colors.GREEN)
+    # Detect PrimeKG data
+    is_primekg = _detect_primekg_data(neo4j_store.driver)
+    if is_primekg:
+        print_colored("  Dataset: PrimeKG biomedical", Colors.GREEN)
     
     if validation_mode:
         if lite_mode:
@@ -615,15 +615,15 @@ def run_interactive_session(
     expand_mode_str = expand_mode
     query_history = []
     
-    # Build tips section with optional PrimeKB examples
+    # Build tips section with optional PrimeKG examples
     tips_section = f"""{Colors.BOLD}Tips:{Colors.RESET}
   - Use arrow keys to navigate command history
   - Press Ctrl+C to cancel current operation
   - Press Ctrl+D or type /quit to exit"""
-    if is_primekb:
+    if is_primekg:
         tips_section += f"""
 
-{Colors.BOLD}PrimeKB Example Queries:{Colors.RESET}
+{Colors.BOLD}PrimeKG Example Queries:{Colors.RESET}
   - What drugs treat diabetes?
   - What are the side effects of aspirin?
   - What genes are associated with Alzheimer's disease?

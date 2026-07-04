@@ -32,12 +32,12 @@ REQUIRED_COLUMNS = {
 }
 
 
-class PrimeKBLoader:
+class PrimeKGLoader:
     """
     Loads and parses triplets from a PrimeKG kg.csv file.
 
     Usage:
-        loader = PrimeKBLoader("data/kg.csv", node_types=["drug", "disease"])
+        loader = PrimeKGLoader("data/kg.csv", node_types=["drug", "disease"])
         triplets = loader.load().parse()
     """
 
@@ -71,7 +71,7 @@ class PrimeKBLoader:
     # Public API (mirrors TripletLoader interface)
     # ------------------------------------------------------------------
 
-    def load(self) -> "PrimeKBLoader":
+    def load(self) -> "PrimeKGLoader":
         """Read the CSV into memory. Returns self for chaining."""
         csv_path = self._resolve_path()
         logger.info(f"Loading PrimeKG from {csv_path}")
@@ -202,7 +202,7 @@ class PrimeKBLoader:
         node_types: Optional[List[str]] = None,
         relation_types: Optional[List[str]] = None,
         max_rows: Optional[int] = None,
-    ) -> "PrimeKBLoader":
+    ) -> "PrimeKGLoader":
         """Load and parse in one call."""
         loader = cls(
             path,
@@ -231,7 +231,7 @@ class PrimeKBLoader:
         raise FileNotFoundError(
             f"Could not find PrimeKG CSV at {self.path}. "
             "Provide a path to kg.csv or a directory containing it. "
-            "Use scripts/download_primekb.py to download the dataset."
+            "Use scripts/download_primekg.py to download the dataset."
         )
 
 
@@ -241,7 +241,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     if len(sys.argv) < 2:
-        print("Usage: python primekb_loader.py <path_to_kg.csv> [--max_rows N]")
+        print("Usage: python primekg_loader.py <path_to_kg.csv> [--max_rows N]")
         sys.exit(1)
 
     path = sys.argv[1]
@@ -249,7 +249,7 @@ if __name__ == "__main__":
     if "--max_rows" in sys.argv:
         max_rows = int(sys.argv[sys.argv.index("--max_rows") + 1])
 
-    loader = PrimeKBLoader(path, max_rows=max_rows)
+    loader = PrimeKGLoader(path, max_rows=max_rows)
     triplets = loader.load().parse()
 
     print(f"\nLoaded {len(triplets)} triplets")

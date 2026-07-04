@@ -117,10 +117,10 @@ generating reproducible question batches that pair well with this mode.
 ## PrimeKG Programmatic Usage
 
 ```python
-from rag import PrimeKBLoader, KGRagIndexer
+from rag import PrimeKGLoader, KGRagIndexer
 
 # Load with filters
-loader = PrimeKBLoader("data/kg.csv", node_types=["drug", "disease"], max_rows=50000)
+loader = PrimeKGLoader("data/kg.csv", node_types=["drug", "disease"], max_rows=50000)
 triplets = loader.load().parse()
 print(f"Node types: {loader.get_unique_node_types()}")
 print(f"Relations: {loader.get_unique_relations()}")
@@ -128,7 +128,7 @@ print(f"Relations: {loader.get_unique_relations()}")
 # Index via the unified interface (auto-detects CSV as PrimeKG)
 indexer = KGRagIndexer()
 indexer.index_from_path("data/kg.csv", node_types=["drug", "disease"], max_rows=50000)
-indexer.save("./output/rag_primekb")
+indexer.save("./output/rag_primekg")
 ```
 
 ---

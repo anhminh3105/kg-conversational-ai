@@ -14,22 +14,22 @@ drug-disease subset).  Pass --input to override.
 
 Usage:
     # Default: import the drug-disease subset
-    python scripts/import_primekb_to_neo4j.py
+    python scripts/import_primekg_to_neo4j.py
 
     # Import the full PrimeKG dataset
-    python scripts/import_primekb_to_neo4j.py --input data/kg.csv
+    python scripts/import_primekg_to_neo4j.py --input data/kg.csv
 
     # Limit rows for a quick test
-    python scripts/import_primekb_to_neo4j.py --max-rows 500
+    python scripts/import_primekg_to_neo4j.py --max-rows 500
 
     # Filter by relation types
-    python scripts/import_primekb_to_neo4j.py --relation-types contraindication,indication
+    python scripts/import_primekg_to_neo4j.py --relation-types contraindication,indication
 
     # Clear existing Triplet nodes before import
-    python scripts/import_primekb_to_neo4j.py --clear
+    python scripts/import_primekg_to_neo4j.py --clear
 
     # Custom Neo4j credentials
-    python scripts/import_primekb_to_neo4j.py --uri bolt://myhost:7687 --password secret
+    python scripts/import_primekg_to_neo4j.py --uri bolt://myhost:7687 --password secret
 
 Prerequisites:
     - Neo4j running (bolt://localhost:7687 by default)
@@ -234,7 +234,7 @@ def write_triplets(
                         f"object_type={row.get('object_type', '')}"
                     ),
                     "embedding": emb.tolist(),
-                    "source": "primekb",
+                    "source": "primekg",
                     "mode": "triplet_text",
                 })
 
@@ -273,10 +273,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python scripts/import_primekb_to_neo4j.py
-  python scripts/import_primekb_to_neo4j.py --input data/kg.csv --max-rows 50000
-  python scripts/import_primekb_to_neo4j.py --relation-types contraindication,indication
-  python scripts/import_primekb_to_neo4j.py --clear --max-rows 1000
+  python scripts/import_primekg_to_neo4j.py
+  python scripts/import_primekg_to_neo4j.py --input data/kg.csv --max-rows 50000
+  python scripts/import_primekg_to_neo4j.py --relation-types contraindication,indication
+  python scripts/import_primekg_to_neo4j.py --clear --max-rows 1000
         """,
     )
     parser.add_argument(
@@ -334,7 +334,7 @@ Examples:
     # --- Load CSV -----------------------------------------------------------
     if not os.path.exists(args.input):
         print(f"ERROR: Input file not found: {args.input}")
-        print("Run  python scripts/download_primekb.py  first to download the dataset.")
+        print("Run  python scripts/download_primekg.py  first to download the dataset.")
         sys.exit(1)
 
     df = load_data(
@@ -410,7 +410,7 @@ Examples:
         print("\nNext steps:")
         print("  python scripts/demo_mcp_agent.py --simple")
         print("  python scripts/interactive_agent.py --lite")
-        print("  python scripts/visualize_kg.py --output outputs/primekb_triplets.png")
+        print("  python scripts/visualize_kg.py --output outputs/primekg_triplets.png")
 
     finally:
         driver.close()

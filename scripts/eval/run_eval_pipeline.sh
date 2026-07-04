@@ -103,7 +103,7 @@ log "Step 1: Ensuring drug-disease CSV exists"
 INPUT_CSV="data/kg_drug_disease.csv"
 if [[ ! -f "$INPUT_CSV" ]]; then
     log "Downloading PrimeKG drug-disease subset"
-    python scripts/download_primekb.py --skip_summary
+    python scripts/download_primekg.py --skip_summary
 fi
 
 if [[ ! -f "$INPUT_CSV" ]]; then
@@ -114,7 +114,7 @@ echo "Input: $INPUT_CSV ($(wc -l < "$INPUT_CSV") lines)"
 # ── 3. Split with tiers ─────────────────────────────────────────────────────
 log "Step 2: Splitting data with tier assignment (max_rows=$MAX_ROWS)"
 
-python scripts/eval/split_primekb.py \
+python scripts/eval/split_primekg.py \
     --input "$INPUT_CSV" \
     --output-dir "$EVAL_DIR" \
     --max-rows "$MAX_ROWS"
@@ -143,7 +143,7 @@ echo "QA dataset: $QA_COUNT questions"
 # ── 5. Import into Neo4j & evaluate ─────────────────────────────────────────
 log "Step 4: Importing train.csv into Neo4j (with --clear)"
 
-python scripts/import_primekb_to_neo4j.py \
+python scripts/import_primekg_to_neo4j.py \
     --input "$EVAL_DIR/train.csv" \
     --uri "$NEO4J_URI" \
     --password "$NEO4J_PASSWORD" \

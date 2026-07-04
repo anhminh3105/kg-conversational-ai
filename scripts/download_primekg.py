@@ -11,11 +11,11 @@ After download, extracts a drug-disease subset by default (can be skipped
 with --no-extract).
 
 Usage:
-    python scripts/download_primekb.py                          # kg.csv + extract drug-disease
-    python scripts/download_primekb.py --all                    # all three files
-    python scripts/download_primekb.py --no-extract             # skip subset extraction
-    python scripts/download_primekb.py --extract drug-disease   # explicit subset
-    python scripts/download_primekb.py --output_dir ./my_data   # custom dir
+    python scripts/download_primekg.py                          # kg.csv + extract drug-disease
+    python scripts/download_primekg.py --all                    # all three files
+    python scripts/download_primekg.py --no-extract             # skip subset extraction
+    python scripts/download_primekg.py --extract drug-disease   # explicit subset
+    python scripts/download_primekg.py --output_dir ./my_data   # custom dir
 """
 
 import argparse
@@ -239,20 +239,20 @@ def main():
 
     if subset_path:
         print(f"\n  Path A — Split + evaluate (drug-disease subset):")
-        print(f"    python scripts/eval/split_primekb.py --input {subset_path}")
-        print(f"    python scripts/import_primekb_to_neo4j.py   # imports data/eval/train.csv")
+        print(f"    python scripts/eval/split_primekg.py --input {subset_path}")
+        print(f"    python scripts/import_primekg_to_neo4j.py   # imports data/eval/train.csv")
         print(f"    python scripts/eval/generate_qa.py --test-csv data/eval/test.csv")
         print(f"    python scripts/eval/evaluate.py --qa-dataset data/eval/qa_dataset.json")
 
     print(f"\n  Path B — RAG pipeline (full or filtered dataset):")
     input_file = subset_path or kg_path
-    print(f"    python scripts/index_rag.py --input {input_file} --format primekb \\")
-    print(f"        --output_dir ./output/rag_primekb")
-    print(f"    python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekb")
+    print(f"    python scripts/index_rag.py --input {input_file} --format primekg \\")
+    print(f"        --output_dir ./output/rag_primekg")
+    print(f"    python scripts/migrate_faiss_to_neo4j.py --faiss-dir ./output/rag_primekg")
     print(f"    python scripts/demo_mcp_agent.py              # run demo")
     print(f"    python scripts/interactive_agent.py            # interactive chat")
     print(f"\n  Path C — Import into Neo4j as :Triplet nodes:")
-    print(f"    python scripts/import_primekb_to_neo4j.py     # uses data/eval/train.csv")
+    print(f"    python scripts/import_primekg_to_neo4j.py     # uses data/eval/train.csv")
     print(f"    python scripts/demo_mcp_agent.py              # run demo")
     print(f"    python scripts/interactive_agent.py            # interactive chat")
     print("=" * 60)

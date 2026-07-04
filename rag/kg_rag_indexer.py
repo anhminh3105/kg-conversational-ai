@@ -194,10 +194,10 @@ class KGRagIndexer:
         Args:
             path: Path to data file or directory
             mode: Representation mode ("triplet_text" or "entity_context")
-            fmt: Data format -- "auto" (detect), "edc", or "primekb"
-            node_types: PrimeKB only -- filter by node types (e.g. ["drug","disease"])
-            relation_types: PrimeKB only -- filter by relation types
-            max_rows: PrimeKB only -- limit number of CSV rows loaded
+            fmt: Data format -- "auto" (detect), "edc", or "primekg"
+            node_types: PrimeKG only -- filter by node types (e.g. ["drug","disease"])
+            relation_types: PrimeKG only -- filter by relation types
+            max_rows: PrimeKG only -- limit number of CSV rows loaded
             batch_size: Batch size for embedding
             show_progress: Whether to show progress bars
             deduplicate: If True, remove duplicate triplets

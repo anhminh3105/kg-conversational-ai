@@ -490,7 +490,7 @@ def evaluate(
     output_path: Optional[str] = None,
     output_dir: str = "data/eval",
     store_type: str = "neo4j",
-    index_dir: str = "./output/rag_primekb",
+    index_dir: str = "./output/rag_primekg",
     neo4j_uri: str = "bolt://localhost:7687",
     neo4j_password: str = "password123",
     verbose: bool = False,
@@ -747,9 +747,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--index-dir",
-        default="./output/rag_primekb",
+        default="./output/rag_primekg",
         help="FAISS index directory, used only with --store-type faiss "
-             "(default: ./output/rag_primekb)",
+             "(default: ./output/rag_primekg)",
     )
     parser.add_argument(
         "--neo4j-uri",

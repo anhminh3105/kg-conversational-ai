@@ -115,7 +115,7 @@ echo "QA dataset: $QA_DATASET ($QA_COUNT questions)"
 # ── 2. Import into Neo4j (clear) ──────────────────────────────────────────────
 log "Importing train.csv into Neo4j (with --clear)"
 
-python scripts/import_primekb_to_neo4j.py \
+python scripts/import_primekg_to_neo4j.py \
     --input "$TRAIN_CSV" \
     --uri "$NEO4J_URI" \
     --password "$NEO4J_PASSWORD" \

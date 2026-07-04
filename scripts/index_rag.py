@@ -353,10 +353,10 @@ Examples:
   python scripts/index_rag.py --input ./rag/edc/output/tmp --output_dir ./output/rag
 
   # Index PrimeKG dataset (auto-detected from .csv extension)
-  python scripts/index_rag.py --input ./data/kg.csv --output_dir ./output/rag_primekb
+  python scripts/index_rag.py --input ./data/kg.csv --output_dir ./output/rag_primekg
 
   # Index PrimeKG with filters (only drug-disease relationships, first 100k rows)
-  python scripts/index_rag.py --input ./data/kg.csv --format primekb \\
+  python scripts/index_rag.py --input ./data/kg.csv --format primekg \\
     --node_types drug,disease --relation_types treats,associates --max_rows 100000
 
   # Search only (retrieve triplets without LLM)
@@ -434,25 +434,25 @@ Examples:
     # Data format options
     parser.add_argument(
         "--format",
-        choices=["auto", "edc", "primekb"],
+        choices=["auto", "edc", "primekg"],
         default="auto",
         help="Input data format (default: auto-detect by file extension)",
     )
     parser.add_argument(
         "--node_types",
         default=None,
-        help="PrimeKB: comma-separated node types to keep (e.g. drug,disease)",
+        help="PrimeKG: comma-separated node types to keep (e.g. drug,disease)",
     )
     parser.add_argument(
         "--relation_types",
         default=None,
-        help="PrimeKB: comma-separated relation types to keep (e.g. treats,associates)",
+        help="PrimeKG: comma-separated relation types to keep (e.g. treats,associates)",
     )
     parser.add_argument(
         "--max_rows",
         type=int,
         default=None,
-        help="PrimeKB: maximum CSV rows to load (useful for large datasets)",
+        help="PrimeKG: maximum CSV rows to load (useful for large datasets)",
     )
 
     # Model options

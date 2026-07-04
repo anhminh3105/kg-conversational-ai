@@ -690,7 +690,7 @@ def main() -> None:
     if not os.path.exists(args.test_csv):
         logger.error(
             f"Test CSV not found: {args.test_csv}\n"
-            "Run:  python scripts/eval/split_primekb.py   first."
+            "Run:  python scripts/eval/split_primekg.py   first."
         )
         sys.exit(1)
 

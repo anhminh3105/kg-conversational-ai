@@ -20,9 +20,9 @@ Outputs (to --output-dir, default data/eval/):
     split_stats.json       -- per-relation and per-tier statistics
 
 Usage:
-    python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv
-    python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv --max-rows 500
-    python scripts/eval/split_primekb.py --input data/kg_drug_disease.csv --test-ratio 0.3
+    python scripts/eval/split_primekg.py --input data/kg_drug_disease.csv
+    python scripts/eval/split_primekg.py --input data/kg_drug_disease.csv --max-rows 500
+    python scripts/eval/split_primekg.py --input data/kg_drug_disease.csv --test-ratio 0.3
 """
 
 from __future__ import annotations
@@ -321,8 +321,8 @@ def main() -> None:
     if not os.path.exists(args.input):
         logger.error(
             f"Input file not found: {args.input}\n"
-            "Run:  python scripts/download_primekb.py          to create it.\n"
-            "  Or: python scripts/download_primekb.py --extract drug-disease"
+            "Run:  python scripts/download_primekg.py          to create it.\n"
+            "  Or: python scripts/download_primekg.py --extract drug-disease"
         )
         sys.exit(1)
 

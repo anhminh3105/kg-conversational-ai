@@ -4,7 +4,7 @@ Visualize the Neo4j Knowledge Graph.
 
 Supports two graph schemas:
   - triplet: :Triplet nodes with (subject, predicate, object) properties
-  - primekb: Native PrimeKG nodes (:Drug, :Disease, etc.) with typed relationships
+  - primekg: Native PrimeKG nodes (:Drug, :Disease, etc.) with typed relationships
 
 Features:
 - Full graph visualization
@@ -23,10 +23,10 @@ Usage:
     python scripts/visualize_kg.py --schema triplet --output outputs/kg_full.png
 
     # Visualize native PrimeKG graph
-    python scripts/visualize_kg.py --schema primekb --output outputs/primekb_graph.png
+    python scripts/visualize_kg.py --schema primekg --output outputs/primekg_graph.png
 
     # Visualize PrimeKG entity subgraph
-    python scripts/visualize_kg.py --schema primekb --entity "aspirin" --depth 2
+    python scripts/visualize_kg.py --schema primekg --entity "aspirin" --depth 2
 
     # Visualize subgraph around an entity
     python scripts/visualize_kg.py --entity "Einstein" --depth 2 --output outputs/kg_einstein.png
@@ -88,10 +88,10 @@ def detect_schema(conn: Neo4jConnection) -> str:
         return "triplet"
 
     result = conn.query(
-        "MATCH (n) WHERE n.primekb_id IS NOT NULL RETURN count(n) AS cnt"
+        "MATCH (n) WHERE n.primekg_id IS NOT NULL RETURN count(n) AS cnt"
     )
     if result and result[0]["cnt"] > 0:
-        return "primekb"
+        return "primekg"
 
     return "triplet"
 
@@ -107,13 +107,13 @@ def fetch_triplets(
     Args:
         conn: Neo4j connection
         max_triplets: Optional limit on number of triplets
-        schema: 'triplet' for :Triplet nodes, 'primekb' for native PrimeKG graph
+        schema: 'triplet' for :Triplet nodes, 'primekg' for native PrimeKG graph
         
     Returns:
         List of triplet dictionaries with subject, predicate, object
     """
-    if schema == "primekb":
-        return _fetch_primekb_triplets(conn, max_triplets)
+    if schema == "primekg":
+        return _fetch_primekg_triplets(conn, max_triplets)
 
     logger.info("Fetching triplets from Neo4j...")
     
@@ -134,7 +134,7 @@ def fetch_triplets(
     return triplets
 
 
-def _fetch_primekb_triplets(
+def _fetch_primekg_triplets(
     conn: Neo4jConnection,
     max_triplets: Optional[int] = None,
 ) -> List[Dict]:
@@ -144,11 +144,11 @@ def _fetch_primekb_triplets(
     limit = f" LIMIT {max_triplets}" if max_triplets else ""
     query = f"""
         MATCH (a)-[r]->(b)
-        WHERE a.primekb_id IS NOT NULL AND b.primekb_id IS NOT NULL
+        WHERE a.primekg_id IS NOT NULL AND b.primekg_id IS NOT NULL
         RETURN a.name AS subject,
                type(r) AS predicate,
                b.name AS object,
-               'primekb_native' AS source
+               'primekg_native' AS source
         {limit}
     """
     triplets = conn.query(query)
@@ -171,13 +171,13 @@ def fetch_entity_subgraph(
         entity: Entity name to center the subgraph on
         depth: Number of hops from the entity
         max_triplets: Maximum triplets to return
-        schema: 'triplet' for :Triplet nodes, 'primekb' for native PrimeKG graph
+        schema: 'triplet' for :Triplet nodes, 'primekg' for native PrimeKG graph
         
     Returns:
         List of triplet dictionaries
     """
-    if schema == "primekb":
-        return _fetch_primekb_entity_subgraph(conn, entity, depth, max_triplets)
+    if schema == "primekg":
+        return _fetch_primekg_entity_subgraph(conn, entity, depth, max_triplets)
 
     logger.info(f"Fetching subgraph for entity '{entity}' with depth {depth}...")
     
@@ -227,7 +227,7 @@ def fetch_entity_subgraph(
     return all_triplets
 
 
-def _fetch_primekb_entity_subgraph(
+def _fetch_primekg_entity_subgraph(
     conn: Neo4jConnection,
     entity: str,
     depth: int = 2,
@@ -246,13 +246,13 @@ def _fetch_primekb_entity_subgraph(
 
         query = """
             MATCH (a)-[r]-(b)
-            WHERE a.primekb_id IS NOT NULL
-              AND b.primekb_id IS NOT NULL
+            WHERE a.primekg_id IS NOT NULL
+              AND b.primekg_id IS NOT NULL
               AND (toLower(a.name) IN $entities OR toLower(b.name) IN $entities)
             RETURN DISTINCT a.name AS subject,
                    type(r) AS predicate,
                    b.name AS object,
-                   'primekb_native' AS source
+                   'primekg_native' AS source
             LIMIT $limit
         """
         triplets = conn.query(query, {
@@ -622,10 +622,10 @@ def main():
     
     parser.add_argument(
         "--schema",
-        choices=["auto", "triplet", "primekb"],
+        choices=["auto", "triplet", "primekg"],
         default="auto",
         help="Graph schema to query: auto (detect), triplet (:Triplet nodes), "
-             "primekb (native PrimeKG typed nodes) (default: auto)"
+             "primekg (native PrimeKG typed nodes) (default: auto)"
     )
     parser.add_argument(
         "--output", "-o",
@@ -710,7 +710,7 @@ def main():
             schema = detect_schema(conn)
             print(f"  Auto-detected schema: {schema}")
         
-        schema_label = "PrimeKG native graph" if schema == "primekb" else "Triplet nodes"
+        schema_label = "PrimeKG native graph" if schema == "primekg" else "Triplet nodes"
         print(f"  Schema: {schema_label}")
         
         # Fetch triplets
@@ -726,7 +726,7 @@ def main():
         else:
             triplets = fetch_triplets(conn, max_triplets=args.max_nodes, schema=schema)
             default_title = (
-                "PrimeKG Knowledge Graph" if schema == "primekb"
+                "PrimeKG Knowledge Graph" if schema == "primekg"
                 else "Knowledge Graph Visualization"
             )
         
